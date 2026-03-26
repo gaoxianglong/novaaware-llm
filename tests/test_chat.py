@@ -39,7 +39,7 @@ def _make_trained_mini_model():
     import torch.nn.functional as F
 
     tokenizer = NovaTokenizer()
-    tokenizer.build_vocab(["你好", "世界", "你叫什么名字", "我是Nova"])
+    tokenizer.train_from_texts(["你好", "世界", "你叫什么名字", "我是Nova"])
 
     config = NovaConfig(
         vocab_size=tokenizer.vocab_size,

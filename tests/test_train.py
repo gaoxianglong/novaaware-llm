@@ -216,7 +216,7 @@ class TestTrain(unittest.TestCase):
         """构建一个极小的训练环境用于快速测试。"""
         tokenizer = NovaTokenizer()
         texts = ["你好", "世界", "你叫什么名字", "我是Nova"]
-        tokenizer.build_vocab(texts)
+        tokenizer.train_from_texts(texts)
 
         config = NovaConfig(
             vocab_size=tokenizer.vocab_size,
@@ -554,7 +554,7 @@ class TestLoadCheckpoint(unittest.TestCase):
         """构建极小训练环境，与 TestTrain 共用同一套 helper。"""
         tokenizer = NovaTokenizer()
         texts = ["你好", "世界", "你叫什么名字", "我是Nova"]
-        tokenizer.build_vocab(texts)
+        tokenizer.train_from_texts(texts)
         config = NovaConfig(
             vocab_size=tokenizer.vocab_size,
             d_model=32, n_heads=2, n_layers=1, d_ff=64,
@@ -746,7 +746,7 @@ class TestTrainLogging(unittest.TestCase):
     def _make_mini_env(self, epochs=20):
         """构建极小训练环境。"""
         tokenizer = NovaTokenizer()
-        tokenizer.build_vocab(["你好", "世界"])
+        tokenizer.train_from_texts(["你好", "世界"])
         config = NovaConfig(
             vocab_size=tokenizer.vocab_size,
             d_model=32, n_heads=2, n_layers=1, d_ff=64,
@@ -884,7 +884,7 @@ class TestTrainSummary(unittest.TestCase):
     def _make_mini_env(self, epochs=10):
         """构建极小训练环境。"""
         tokenizer = NovaTokenizer()
-        tokenizer.build_vocab(["你好", "世界", "你叫什么名字", "我是Nova"])
+        tokenizer.train_from_texts(["你好", "世界", "你叫什么名字", "我是Nova"])
         config = NovaConfig(
             vocab_size=tokenizer.vocab_size,
             d_model=32, n_heads=2, n_layers=1, d_ff=64,
@@ -1017,7 +1017,7 @@ class TestAcceptanceCriteria(unittest.TestCase):
     def _make_mini_env(self, epochs=10):
         """构建极小训练环境。"""
         tokenizer = NovaTokenizer()
-        tokenizer.build_vocab(["你好", "世界", "你叫什么名字", "我是Nova"])
+        tokenizer.train_from_texts(["你好", "世界", "你叫什么名字", "我是Nova"])
         config = NovaConfig(
             vocab_size=tokenizer.vocab_size,
             d_model=32, n_heads=2, n_layers=1, d_ff=64,

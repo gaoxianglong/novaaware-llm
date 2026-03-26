@@ -81,10 +81,10 @@ class NovaConfig:
     d_ff: int = 1536
 
     # 预训练token上下文长度
-    pretrain_max_seq_len: int = 1024
+    pretrain_max_seq_len: int = 128
     # 微调token上下文长度
-    finetune_max_seq_len: int = 1024
-    max_seq_len: int = 1024
+    finetune_max_seq_len: int = 128
+    max_seq_len: int = 128
 
     # dropout概率,推理时关闭
     dropout: float = 0.1
@@ -97,11 +97,11 @@ class NovaConfig:
     # ========================
 
     # 预训练阶段的 batch_size
-    pretrain_batch_size: int = 64
+    pretrain_batch_size: int = 8
 
     # 微调阶段的 batch_size
     finetune_batch_size: int = 16
-    batch_size: int = 64
+    batch_size: int = 8
 
     # 预训练轮数
     pretrain_epochs: int = 1

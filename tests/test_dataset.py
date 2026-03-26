@@ -39,7 +39,7 @@ def _make_tokenizer(texts: list[str] | None = None) -> NovaTokenizer:
     if texts is None:
         texts = ["你好", "世界", "你叫什么名字", "我是Nova", "计算机是科技发明"]
     tokenizer = NovaTokenizer()
-    tokenizer.build_vocab(texts, vocab_size=500)
+    tokenizer.train_from_texts(texts, vocab_size=500)
     return tokenizer
 
 

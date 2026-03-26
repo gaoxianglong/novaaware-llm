@@ -1,11 +1,10 @@
 """NovaTokenizer BPE 分词器单元测试
 
-按功能模块拆分为 5 个测试类:
+按功能模块拆分为 4 个测试类:
   TestTrainFromTexts — BPE 训练（词表构建）
   TestEncode         — 编码方法（文本 → token ID 列表）
   TestDecode         — 解码方法（token ID 列表 → 文本）
   TestSaveLoad       — 持久化与恢复
-  TestBackwardCompat — 向后兼容性（旧接口 build_vocab 等）
 
 覆盖要点:
   ✓ 特殊 token 的 ID 固定为 0-4
@@ -15,8 +14,6 @@
   ✓ 空输入处理
   ✓ 未知字符处理（UNK）
   ✓ save/load 后行为完全一致
-  ✓ 旧接口 build_vocab 兼容性
-  ✓ char_to_id / id_to_char 兼容属性
 
 运行方式:
   .venv/bin/python -m pytest tests/test_tokenizer.py -v
@@ -30,8 +27,7 @@ import unittest
 from tokenizer import (
     NovaTokenizer,
     PAD_ID, BOS_ID, EOS_ID, SEP_ID, UNK_ID,
-    PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, SEP_TOKEN, UNK_TOKEN,
-    NUM_SPECIAL, SPECIAL_TOKENS,
+    NUM_SPECIAL,
 )
 
 
@@ -72,19 +68,11 @@ class TestTrainFromTexts(unittest.TestCase):
     train_from_texts 的职责:
       1. 用 BPE 算法在训练文本上学习子词合并规则
       2. 构建词表（特殊 token ID 0-4 + BPE 子词）
-      3. 填充 char_to_id / id_to_char / vocab_size 兼容属性
+      3. 更新 vocab_size
     """
 
     def setUp(self) -> None:
         self.tokenizer = _make_tokenizer()
-
-    def test_special_token_ids_are_fixed(self) -> None:
-        """特殊 token 的 ID 必须固定为 0-4，与训练数据无关。"""
-        self.assertEqual(self.tokenizer.char_to_id[PAD_TOKEN], PAD_ID)
-        self.assertEqual(self.tokenizer.char_to_id[BOS_TOKEN], BOS_ID)
-        self.assertEqual(self.tokenizer.char_to_id[EOS_TOKEN], EOS_ID)
-        self.assertEqual(self.tokenizer.char_to_id[SEP_TOKEN], SEP_ID)
-        self.assertEqual(self.tokenizer.char_to_id[UNK_TOKEN], UNK_ID)
 
     def test_vocab_size_is_positive(self) -> None:
         """词表大小应大于特殊 token 数量。"""
@@ -95,26 +83,6 @@ class TestTrainFromTexts(unittest.TestCase):
         target = 200
         tok = _make_tokenizer(vocab_size=target)
         self.assertLessEqual(tok.vocab_size, target)
-
-    def test_vocab_includes_all_special_tokens(self) -> None:
-        """词表中必须包含所有 5 个特殊 token。"""
-        for token in SPECIAL_TOKENS:
-            self.assertIn(token, self.tokenizer.char_to_id,
-                          f"特殊 token '{token}' 不在词表中")
-
-    def test_bidirectional_map_consistency(self) -> None:
-        """char_to_id 和 id_to_char 必须互为逆映射且长度一致。"""
-        self.assertEqual(len(self.tokenizer.char_to_id),
-                         len(self.tokenizer.id_to_char))
-        for token, tid in self.tokenizer.char_to_id.items():
-            self.assertEqual(self.tokenizer.id_to_char[tid], token,
-                             f"char_to_id['{token}']={tid}，"
-                             f"但 id_to_char[{tid}]='{self.tokenizer.id_to_char.get(tid)}'")
-
-    def test_vocab_size_matches_mapping_length(self) -> None:
-        """vocab_size 必须等于 char_to_id 字典的长度。"""
-        self.assertEqual(self.tokenizer.vocab_size,
-                         len(self.tokenizer.char_to_id))
 
     def test_retrain_resets_cleanly(self) -> None:
         """重新训练应完全重置分词器状态。"""
@@ -380,18 +348,6 @@ class TestSaveLoad(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_special_token_ids_preserved_after_load(self) -> None:
-        """加载后特殊 token 的 ID 仍然是 0-4。"""
-        loaded, path = self._save_and_load()
-        try:
-            self.assertEqual(loaded.char_to_id[PAD_TOKEN], PAD_ID)
-            self.assertEqual(loaded.char_to_id[BOS_TOKEN], BOS_ID)
-            self.assertEqual(loaded.char_to_id[EOS_TOKEN], EOS_ID)
-            self.assertEqual(loaded.char_to_id[SEP_TOKEN], SEP_ID)
-            self.assertEqual(loaded.char_to_id[UNK_TOKEN], UNK_ID)
-        finally:
-            os.unlink(path)
-
     def test_load_overwrites_previous_state(self) -> None:
         """load 会完全覆盖之前的状态。"""
         loaded, path = self._save_and_load()
@@ -417,84 +373,19 @@ class TestSaveLoad(unittest.TestCase):
         finally:
             os.unlink(tmp.name)
 
-    def test_char_to_id_consistent_after_load(self) -> None:
-        """加载后 char_to_id 映射应与原始一致。"""
-        loaded, path = self._save_and_load()
-        try:
-            self.assertEqual(loaded.char_to_id, self.tokenizer.char_to_id)
-        finally:
-            os.unlink(path)
-
-    def test_id_to_char_consistent_after_load(self) -> None:
-        """加载后 id_to_char 映射应与原始一致。"""
-        loaded, path = self._save_and_load()
-        try:
-            self.assertEqual(loaded.id_to_char, self.tokenizer.id_to_char)
-        finally:
-            os.unlink(path)
-
-
-# ======================================================================
-# 向后兼容性测试
-#
-# 确保旧代码中使用的接口（build_vocab、char_to_id 等）
-# 在 BPE 分词器下仍然正常工作。
-# ======================================================================
-class TestBackwardCompat(unittest.TestCase):
-    """测试向后兼容性：旧接口在 BPE 分词器下仍能正常工作。
-
-    旧代码中使用的接口:
-      - tokenizer.build_vocab(texts)          → 构建词表
-      - tokenizer.char_to_id[BOS_TOKEN]       → 获取特殊 token ID
-      - tokenizer.char_to_id[SEP_TOKEN]       → 获取特殊 token ID
-      - tokenizer.char_to_id[EOS_TOKEN]       → 获取特殊 token ID
-      - tokenizer.encode(text)                → 编码
-      - tokenizer.decode(ids)                 → 解码
-      - tokenizer.vocab_size                  → 词表大小
-      - tokenizer.save(path) / .load(path)    → 持久化
-    """
-
-    def test_build_vocab_works_as_alias(self) -> None:
-        """build_vocab 应作为 train_from_texts 的别名正常工作。"""
-        tokenizer = NovaTokenizer()
-        tokenizer.build_vocab(SAMPLE_TEXTS)
-        self.assertGreater(tokenizer.vocab_size, 0)
-        ids = tokenizer.encode("你好")
-        self.assertIsInstance(ids, list)
-        self.assertGreater(len(ids), 0)
-
-    def test_char_to_id_has_special_tokens(self) -> None:
-        """char_to_id 字典必须包含所有特殊 token。"""
-        tokenizer = _make_tokenizer()
-        self.assertIn(BOS_TOKEN, tokenizer.char_to_id)
-        self.assertIn(SEP_TOKEN, tokenizer.char_to_id)
-        self.assertIn(EOS_TOKEN, tokenizer.char_to_id)
-        self.assertIn(PAD_TOKEN, tokenizer.char_to_id)
-        self.assertIn(UNK_TOKEN, tokenizer.char_to_id)
-
-    def test_special_token_ids_match_constants(self) -> None:
-        """char_to_id 中特殊 token 的 ID 必须与模块级常量一致。"""
-        tokenizer = _make_tokenizer()
-        self.assertEqual(tokenizer.char_to_id[PAD_TOKEN], PAD_ID)
-        self.assertEqual(tokenizer.char_to_id[BOS_TOKEN], BOS_ID)
-        self.assertEqual(tokenizer.char_to_id[EOS_TOKEN], EOS_ID)
-        self.assertEqual(tokenizer.char_to_id[SEP_TOKEN], SEP_ID)
-        self.assertEqual(tokenizer.char_to_id[UNK_TOKEN], UNK_ID)
-
-    def test_dataset_style_token_construction(self) -> None:
+    def test_token_construction_dataset_style(self) -> None:
         """模拟 dataset.py 的 token 拼接方式：
         [BOS_ID] + encode(question) + [SEP_ID] + encode(answer) + [EOS_ID]
         """
-        tokenizer = _make_tokenizer()
         question = "你叫什么名字？"
         answer = "我是Nova。"
 
         token_ids = (
-            [tokenizer.char_to_id[BOS_TOKEN]]
-            + tokenizer.encode(question)
-            + [tokenizer.char_to_id[SEP_TOKEN]]
-            + tokenizer.encode(answer)
-            + [tokenizer.char_to_id[EOS_TOKEN]]
+            [BOS_ID]
+            + self.tokenizer.encode(question)
+            + [SEP_ID]
+            + self.tokenizer.encode(answer)
+            + [EOS_ID]
         )
 
         self.assertEqual(token_ids[0], BOS_ID)
@@ -502,29 +393,21 @@ class TestBackwardCompat(unittest.TestCase):
         self.assertIn(SEP_ID, token_ids)
         self.assertGreater(len(token_ids), 3)
 
-    def test_chat_style_token_construction(self) -> None:
+    def test_token_construction_chat_style(self) -> None:
         """模拟 chat.py 的 prompt 拼接方式：
         [BOS_ID] + encode(question) + [SEP_ID]
         """
-        tokenizer = _make_tokenizer()
         question = "你好吗？"
 
         input_ids = (
-            [tokenizer.char_to_id[BOS_TOKEN]]
-            + tokenizer.encode(question)
-            + [tokenizer.char_to_id[SEP_TOKEN]]
+            [BOS_ID]
+            + self.tokenizer.encode(question)
+            + [SEP_ID]
         )
 
         self.assertEqual(input_ids[0], BOS_ID)
         self.assertEqual(input_ids[-1], SEP_ID)
         self.assertGreater(len(input_ids), 2)
-
-    def test_build_vocab_with_custom_vocab_size(self) -> None:
-        """build_vocab 支持传入 vocab_size 参数。"""
-        tokenizer = NovaTokenizer()
-        tokenizer.build_vocab(SAMPLE_TEXTS, vocab_size=200)
-        self.assertLessEqual(tokenizer.vocab_size, 200)
-        self.assertGreater(tokenizer.vocab_size, NUM_SPECIAL)
 
 
 if __name__ == "__main__":

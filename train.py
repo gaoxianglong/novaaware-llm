@@ -731,7 +731,7 @@ def setup(
     for pair in qa_pairs:
         all_texts.append(pair["question"])
         all_texts.append(pair["answer"])
-    tokenizer.build_vocab(all_texts)
+    tokenizer.train_from_texts(all_texts)
     tokenizer.save("data/tokenizer.json")
     print(f"       词表大小: {tokenizer.vocab_size}，已保存到 data/tokenizer.json")
 

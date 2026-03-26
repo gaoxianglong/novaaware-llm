@@ -29,6 +29,22 @@
 │  两个阶段共用同一个 BPE 分词器（在预训练数据上训练生成）              │
 └─────────────────────────────────────────────────────────────────────┘
 
+源码阅读顺序（建议按编号顺序阅读）:
+┌──────────────────────────────────────────────────────────────────────┐
+│  ① load_pretrain_data()   — JSONL 加载预训练纯文本（最基础的 I/O）   │
+│  ② load_qa_pairs()        — JSONL 加载微调问答对（与 ① 结构相似）    │
+│  ③ _encode_and_pad()      — 截断/填充/构造 labels 的共用逻辑         │
+│  ④ PretrainDataset        — 预训练数据集（依赖 ① ③）                │
+│  ⑤ NovaDataset            — 微调数据集（依赖 ② ③）                  │
+│  ⑥ create_dataloader()    — DataLoader 工厂（依赖 ④ ⑤）             │
+│                                                                      │
+│  推荐理由:                                                            │
+│    先读 ①② 理解数据从磁盘怎么来;                                     │
+│    再读 ③ 理解 input_ids / target_ids 怎么构造;                      │
+│    然后读 ④⑤ 看两种数据集如何调用 ③ 完成编码;                        │
+│    最后读 ⑥ 看数据怎么按 batch 喂给模型。                             │
+└──────────────────────────────────────────────────────────────────────┘
+
 一条预训练数据从原始文本到模型输入的完整变换过程:
 
   原始 JSONL:
@@ -72,11 +88,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from tokenizer import NovaTokenizer, BOS_TOKEN, EOS_TOKEN, SEP_TOKEN, PAD_ID
+from tokenizer import NovaTokenizer, BOS_ID, EOS_ID, SEP_ID, PAD_ID
 
 
 # ======================================================================
-# _encode_and_pad —— 内部辅助函数
+# ③ _encode_and_pad —— 内部辅助函数（阅读顺序第 3）
 #
 # PretrainDataset 和 NovaDataset 都需要做同样的事：
 #   token_ids → 截断 → 填充 → 构造 input_ids / labels
@@ -135,7 +151,7 @@ def _encode_and_pad(
 
 
 # ======================================================================
-# PretrainDataset —— 预训练阶段数据集
+# ④ PretrainDataset —— 预训练阶段数据集（阅读顺序第 4）
 #
 # 典型调用顺序（在 train.py 中）:
 #
@@ -194,8 +210,10 @@ class PretrainDataset(Dataset):
         tokenizer: NovaTokenizer,
         max_seq_len: int,
     ) -> None:
-        bos_id = tokenizer.char_to_id[BOS_TOKEN]
-        eos_id = tokenizer.char_to_id[EOS_TOKEN]
+        bos_id = BOS_ID
+        eos_id = EOS_ID
+
+        texts = [t for t in texts if t.strip()]
 
         n = len(texts)
         self.input_ids = np.zeros((n, max_seq_len), dtype=np.int16)
@@ -234,7 +252,7 @@ class PretrainDataset(Dataset):
 
 
 # ======================================================================
-# NovaDataset —— 微调阶段数据集
+# ⑤ NovaDataset —— 微调阶段数据集（阅读顺序第 5）
 #
 # 典型调用顺序（在 train.py 中）:
 #
@@ -271,9 +289,9 @@ class NovaDataset(Dataset):
         tokenizer: NovaTokenizer,
         max_seq_len: int,
     ) -> None:
-        bos_id = tokenizer.char_to_id[BOS_TOKEN]
-        sep_id = tokenizer.char_to_id[SEP_TOKEN]
-        eos_id = tokenizer.char_to_id[EOS_TOKEN]
+        bos_id = BOS_ID
+        sep_id = SEP_ID
+        eos_id = EOS_ID
 
         n = len(qa_pairs)
         self.input_ids = np.zeros((n, max_seq_len), dtype=np.int16)
@@ -319,7 +337,7 @@ class NovaDataset(Dataset):
 
 
 # ======================================================================
-# DataLoader 工厂函数
+# ⑥ DataLoader 工厂函数（阅读顺序第 6）
 #
 # 预训练和微调阶段都使用同一个函数创建 DataLoader。
 #
@@ -355,7 +373,7 @@ def create_dataloader(
 
 
 # ======================================================================
-# 辅助函数：从 JSONL 文件/目录加载微调数据（qa_pairs）
+# ② 辅助函数：从 JSONL 文件/目录加载微调数据（qa_pairs）（阅读顺序第 2）
 #
 # 调用时机: train.py 微调阶段
 #   qa_pairs = load_qa_pairs("data/sft/")                    # 加载目录下所有 .jsonl
@@ -408,7 +426,7 @@ def load_qa_pairs(path: str) -> List[Dict[str, str]]:
 
 
 # ======================================================================
-# 辅助函数：从 JSONL 文件/目录加载预训练数据（纯文本）
+# ① 辅助函数：从 JSONL 文件/目录加载预训练数据（纯文本）（阅读顺序第 1）
 #
 # 调用时机: train.py 预训练阶段
 #   texts = load_pretrain_data("data/pretrain/")      # 加载目录下所有 .jsonl

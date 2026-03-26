@@ -78,7 +78,7 @@ import torch
 import torch.nn.functional as F
 
 from config import NovaConfig
-from tokenizer import NovaTokenizer, BOS_TOKEN, SEP_TOKEN, EOS_ID
+from tokenizer import NovaTokenizer, BOS_ID, SEP_ID, EOS_ID
 from model import NovaModel
 
 
@@ -211,9 +211,9 @@ def generate(
     # 普通文本进行子词切分，而不是当作 BOS 特殊标记。
     # 必须手动拼接特殊标记的 ID，和 dataset.py 保持一致。
     input_ids = (
-        [tokenizer.char_to_id[BOS_TOKEN]]
+        [BOS_ID]
         + tokenizer.encode(question)
-        + [tokenizer.char_to_id[SEP_TOKEN]]
+        + [SEP_ID]
     )
     # 转为 tensor，形状 [1, seq_len]（1 是 batch_size，推理时只有一条）
     ids = torch.tensor([input_ids], dtype=torch.long, device=device)
