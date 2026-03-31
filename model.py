@@ -196,7 +196,7 @@ class MultiHeadAttention(nn.Module):
         #   头0: [0.1, 0.2, 0.3, 0.4]    ← 前4个数字
         #   头1: [0.5, 0.6, 0.7, 0.8]    ← 后4个数字
 
-        # 使用transpose 让索引位1(n_heads)和2(seq_len)交换，数据结构会变成 [batch, seq_len, n_heads, head_dim] → [batch, n_heads, seq_len, head_dim]
+        # 使用 transpose 让索引位1(seq_len)和2(n_heads)交换，数据结构会变成 [batch, seq_len, n_heads, head_dim] → [batch, n_heads, seq_len, head_dim]
         # 目的是让按token分组变为按注意力头分组，便于后续的并行独立计算。
         # 交换前（按 token 分组）：
         #   token0: 头0[0.1,0.2,0.3,0.4], 头1[0.5,0.6,0.7,0.8]
@@ -211,7 +211,51 @@ class MultiHeadAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # ── 步骤 3-7: FlashAttention (缩放点积 + 因果掩码 + softmax + dropout + 加权求和) ──
+        # 3、pytorch的scaled_dot_product_attention函数会依次执行 Q·K 点积 → 缩放（÷√d） → 因果掩码 → softmax → dropout → 加权求和
+        # 3.1、QK点积：每个自注意力头里，每个token的Q和所有token的K做点积，算出关联度分数，得到关联度矩阵
+        # 假设 4 个 token（<s>你好吗），每个头负责token的 4 维向量：
+        #   Q_好 = [0.3, 0.1, -0.2, 0.4]
+        #   K_<s> = [0.1, -0.1, 0.0, 0.0]
+        #   K_你  = [0.4, 0.2, -0.3, 0.3]
+        #   K_好  = [0.3, 0.1, -0.2, 0.4]
+        #   K_吗  = [0.2, 0.0, -0.1, 0.2]
+        # "好"对"<s>"的分数 = Q_好 · K_<s> = 0.3×0.1 + 0.1×(-0.1) + (-0.2)×0.0 + 0.4×0.0 = 0.02
+        # "好"对"你"的分数  = Q_好 · K_你  = 0.3×0.4 + 0.1×0.2 + (-0.2)×(-0.3) + 0.4×0.3 = 0.32
+        # "好"对"好"的分数  = Q_好 · K_好  = 0.3×0.3 + 0.1×0.1 + (-0.2)×(-0.2) + 0.4×0.4 = 0.30
+        # "好"对"吗"的分数  = Q_好 · K_吗  = 0.3×0.2 + 0.1×0.0 + (-0.2)×(-0.1) + 0.4×0.2 = 0.16
+        # 每个 token 都这样算，得到一个 4×4 的分数矩阵
+
+        # 3.2、缩放，点积结果 ÷ √head_dim
+        # 之所以要做缩放，是因为QK点积过程中，如果向量维度越大，点积结果的绝对值就越大，容易导致后续softmax变得极端，导致模型训练不稳定
+        # head_dim = 4 时：  Q·K = a₁b₁ + a₂b₂ + a₃b₃ + a₄b₄           → 4项求和
+        # head_dim = 64 时： Q·K = a₁b₁ + a₂b₂ + ... + a₆₄b₆₄          → 64项求和
+        # 例：head_dim=64，缩放前分数 [8.0, 3.0, 1.0, 2.0]
+        #   softmax → [0.99, 0.01, 0.00, 0.00]  ← 缩放前 softmax 极端到只剩一个 token 有权重
+        #   ÷√64=÷8 → [1.0, 0.375, 0.125, 0.25]
+        #   softmax → [0.41, 0.22, 0.17, 0.19]  ← 缩放后权重分布会变得温和，模型能综合多个 token 的信息
+
+        # 3.3、因果掩码，覆盖掉未来
+        # 点积原始结果 scores[i][j] = Q_i · K_j：        因果掩码后（把右上角替换为 -inf）：
+        # K_<s>  K_你  K_好  K_吗                       K_<s>  K_你  K_好  K_吗
+        # <s>  → [ 0.5,  0.3,  0.8,  0.2 ]    →    <s>  → [ 0.5, -inf, -inf, -inf ]
+        # 你   → [ 0.1,  0.6,  0.4,  0.7 ]    →    你   → [ 0.1,  0.6, -inf, -inf ]
+        # 好   → [ 0.2,  0.9,  0.5,  0.3 ]    →    好   → [ 0.2,  0.9,  0.5, -inf ]
+        # 吗   → [ 0.3,  0.4,  0.6,  0.8 ]    →    吗   → [ 0.3,  0.4,  0.6,  0.8 ]
+        # 训练时，整个序列 <s> 你 好 吗 是一次性喂给模型的，如果不加掩码，模型在预测下一个token的时候，就能直接看到好和吗。
+        # 因果掩码强制每个 token 只能看自己和前面的，以便于让模型真正学到预测能力。
+
+        # 3.4、softmax归一化，把因果掩码后的QK关联度分数转为注意力权重(百分比权重) ，点积矩阵中的每一行的各个位置的分数都会被转换为百分比权重
+        # [3.1, 0.4, 0.5, -inf] → [0.88, 0.06, 0.07, 0.00]
+
+        # 3.5、dropout是为了避免模型训练过程中过拟合，随机把归一化的注意力权重设置为0
+
+        # 3.6、把QK注意力权重 和 V矩阵 做矩阵乘法，得到融合了当前上下文的新向量激活值
+        # "好"的注意力权重：[0.21, 0.50, 0.29, 0.00]
+        #                 <s>   你    好    吗
+        # V_<s> = [1.0, 0.0, 0.5, 0.2]   ← <s> 的"实际内容"
+        # V_你  = [0.3, 0.8, 0.1, 0.6]   ← 你 的"实际内容"
+        # V_好  = [0.5, 0.4, 0.7, 0.3]   ← 好 的"实际内容"
+        # "好"的新向量 = 0.21×V_<s> + 0.50×V_你 + 0.29×V_好 = [0.51, 0.52, 0.36, 0.43]
         attn_output = F.scaled_dot_product_attention(
             q,
             k,
@@ -220,146 +264,33 @@ class MultiHeadAttention(nn.Module):
             is_causal=True,
         )
 
-        # ── 步骤 8: 合并多头 ──
-        # transpose 把 n_heads 移回去:
-        #   [batch, n_heads, seq_len, head_dim] → [batch, seq_len, n_heads, head_dim]
-        # contiguous() 保证内存连续（transpose 只改变 stride，不移动数据）
-        # view 把最后两维拼成 d_model:
-        #   → [batch, seq_len, d_model]
+        # 4、concat，把多个头的结果拼接在一起，并转换为回Tensor的形状([batch, seq_len, d_model]三维数组)，也就是还原一个完整的token向量的d_model维的激活值
+        #   头1结果: [64维] →
+        #   头2结果: [64维]
+        #   头3结果: [64维] →  直接拼接  →  [384维]
+        #   头4结果: [64维] →
+        #   头5结果: [64维] →
+        #   头6结果: [64维] →
         attn_output = (
             attn_output.transpose(1, 2)
             .contiguous()
             .view(batch_size, seq_len, self.d_model)
         )
 
-        # ── 步骤 9: 输出投影 ──
-        # 通过 W_O 混合各头的信息，让不同头学到的特征互相融合
-        return self.w_o(attn_output)  # [batch, seq_len, d_model]
-
-
-# ──── ③ 阅读完毕 ──── 下一步请阅读 ④ TransformerBlock ────────────────
+        # 5、W_O投影，把QK*V矩阵的新激活值和W_O矩阵做矩阵乘法，把多头学到的内容相互融合
+        return self.w_o(attn_output)
 
 
 # ======================================================================
-# ④ TransformerBlock —— 一层 Decoder Block（阅读顺序第 4，依赖 ① ② ③）
+# TransformerBlock层，这里主要是串联各层Block和其各子层的计算
 # ======================================================================
 class TransformerBlock(nn.Module):
-    """一层 Transformer Decoder Block — Pre-LN（先归一化再计算）结构。
-
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  在整个模型中的位置                                               │
-    │                                                                  │
-    │  NovaModel.forward:                                              │
-    │    token_emb + pos_emb → Dropout                                 │
-    │        │                                                         │
-    │        ▼                                                         │
-    │    【TransformerBlock 第 0 层】                                   │
-    │        │                                                         │
-    │        ▼                                                         │
-    │    【TransformerBlock 第 1 层】                                   │
-    │        │                                                         │
-    │        ▼                                                         │
-    │    【TransformerBlock 第 2 层】                                   │
-    │        │                                                         │
-    │        ▼                                                         │
-    │    【TransformerBlock 第 3 层】                                   │
-    │        │                                                         │
-    │        ▼                                                         │
-    │    final RMSNorm → 输出层 → logits                               │
-    │                                                                  │
-    │  4 层 Block 共享相同的结构，但各自有独立的可学习参数。              │
-    │  每过一层，向量的"理解深度"加深一层：                              │
-    │    第 0 层: 字符搭配 —— "好吗"经常连在一起                        │
-    │    第 1 层: 句法结构 —— 这是一个问句                              │
-    │    第 2 层: 语义理解 —— 有人在问候我                              │
-    │    第 3 层: 意图判断 —— 我应该用问候语回答                        │
-    └──────────────────────────────────────────────────────────────────┘
-
-    Pre-LN 结构详解
-    ───────────────
-    "Pre-LN" 的意思是**先归一化，再做计算**。与之对应的是 "Post-LN"
-    （先计算，再归一化），这是原始 Transformer 论文用的方式。
-
-    Pre-LN（Nova / LLaMA / GPT-3 使用）:
-      x → RMSNorm → Attention → + x → RMSNorm → FFN → + x
-          ^^^^^^^^ 先归一化                ^^^^^^^^ 先归一化
-
-    Post-LN（原始 Transformer 论文）:
-      x → Attention → + x → LayerNorm → FFN → + x → LayerNorm
-                             ^^^^^^^^^ 后归一化        ^^^^^^^^^ 后归一化
-
-    为什么用 Pre-LN？
-      - 训练更稳定：归一化后的输入数值范围可控，Attention/FFN 不会收到
-        暴涨或趋零的输入
-      - 梯度流更顺畅：残差连接直接把梯度传回去，不需要"穿过"归一化层
-      - 不容易出现训练早期 loss 爆炸的问题
-      - LLaMA、GPT-3、PaLM 等现代大模型全部采用 Pre-LN
-
-    一层 Block 的完整数据流（以 "你好吗？" 为例）
-    ──────────────────────────────────────────────
-    输入 x: [batch, seq_len, 128]  — 4 个 token 的 128 维向量
-
-    ┌─── 前半段：自注意力（token 之间互相"对话"） ───────────────────┐
-    │                                                              │
-    │  步骤 A1: attn_norm = RMSNorm(x)                             │
-    │           把数值拉回正常范围，防止 Attention 收到极端输入        │
-    │                                                              │
-    │  步骤 A2: attn_out = MultiHeadAttention(attn_norm)            │
-    │           4 个头各自做 Q·K·V 注意力，融合上下文信息             │
-    │           "好" 从 "你" 和 "吗" 那里收集了相关信息              │
-    │                                                              │
-    │  步骤 A3: x = x + attn_out     （残差连接）                   │
-    │           即使 Attention 算出了垃圾，原始 x 还在               │
-    │           等价于 output = 原始信息 + 新增信息                  │
-    │                                                              │
-    └──────────────────────────────────────────────────────────────┘
-
-    ┌─── 后半段：前馈网络（每个 token 独立"消化"信息） ─────────────┐
-    │                                                              │
-    │  步骤 B1: ffn_norm = RMSNorm(x)                              │
-    │           再次归一化（经过 Attention + 残差后数值可能又飘了）    │
-    │                                                              │
-    │  步骤 B2: ffn_out = SwiGLUFFN(ffn_norm)                      │
-    │           128→512→128 的展开-过滤-压缩，每个 token 独立处理    │
-    │           "好" 独自消化从上一步收集来的上下文信息              │
-    │                                                              │
-    │  步骤 B3: x = x + ffn_out      （残差连接）                   │
-    │           再一次兜底                                          │
-    │                                                              │
-    └──────────────────────────────────────────────────────────────┘
-
-    输出 x: [batch, seq_len, 128]  — 形状不变，内容更"深层"了
-
-    参数说明
-    ────────
-    d_model : int
-        向量维度（128）。
-
-    n_heads : int
-        注意力头数（4）。
-
-    d_ff : int
-        FFN 隐藏层维度（512）。
-
-    dropout : float
-        Dropout 概率（0.1），用于 Attention 内部。
-
-    子模块和参数量（每层）
-    ──────────────────────
-    attn_norm : RMSNorm          →  128 个参数（gamma）
-    attn      : MultiHeadAttention → 4 × 128² = 65,536 个参数
-    ffn_norm  : RMSNorm          →  128 个参数（gamma）
-    ffn       : SwiGLUFFN        → 3 × 128 × 512 = 196,608 个参数
-    ───────────────────────────────────────────────────────────
-    每层合计:  262,400 个参数
-    4 层合计:  1,049,600 个参数
-    """
-
     def __init__(
         self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1
     ) -> None:
         super().__init__()
 
+        # RMSNorm → 多头自注意力计算 → 残差连接 → RMSNorm → SwiGLU FFN（前馈网络） → 残差连接
         # ── 前半段子模块：归一化 + 自注意力 ──
         self.attn_norm = RMSNorm(d_model)
         self.attn = MultiHeadAttention(d_model, n_heads, dropout)
@@ -369,21 +300,6 @@ class TransformerBlock(nn.Module):
         self.ffn = SwiGLUFFN(d_model, d_ff)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """前向传播：Pre-LN 结构的一层 Decoder Block。
-
-        参数:
-          x : Tensor，形状 [batch_size, seq_len, d_model]
-              例如 [16, 128, 128]
-
-        返回:
-          Tensor，形状与输入相同 [batch_size, seq_len, d_model]
-              经过一次"讨论 + 消化"后的向量
-
-        调用时机:
-          在 NovaModel.forward 中被循环调用:
-            for block in self.blocks:
-                x = block(x)      # ← 每层调用一次，共 4 次
-        """
         # ── 前半段：归一化 → 自注意力 → 残差连接 ──
         # 步骤 A1: 归一化（拉回正常范围）
         # 步骤 A2: 多头因果自注意力（token 之间交换信息）
