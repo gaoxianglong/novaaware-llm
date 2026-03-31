@@ -10,19 +10,45 @@
 │  输入 token IDs: [batch_size, seq_len]                              │
 │       │                                                             │
 │       ▼                                                             │
-│  NovaModel（完整模型，步骤 5.5）                                     │
+│  NovaModel（完整模型，⑤）                                           │
 │   ├── Token Embedding    查字义表: token ID → 128维向量              │
 │   ├── Position Embedding 查位置表: 位置编号 → 128维向量              │
 │   ├── Dropout                                                       │
-│   ├── TransformerBlock × 4 层（步骤 5.4）                            │
-│   │    ├── RMSNorm（步骤 5.1）→ MultiHeadAttention（步骤 5.3）→ 残差 │
-│   │    └── RMSNorm（步骤 5.1）→ SwiGLUFFN（步骤 5.2）→ 残差         │
+│   ├── TransformerBlock × 4 层（④）                                   │
+│   │    ├── RMSNorm（①）→ MultiHeadAttention（③）→ 残差              │
+│   │    └── RMSNorm（①）→ SwiGLUFFN（②）→ 残差                      │
 │   ├── RMSNorm（最终归一化）                                          │
 │   └── Linear 输出层: 128维 → vocab_size                             │
 │       │                                                             │
 │       ▼                                                             │
 │  输出 logits: [batch_size, seq_len, vocab_size]                     │
 └─────────────────────────────────────────────────────────────────────┘
+
+源码阅读顺序（建议按编号顺序，由内而外阅读）:
+┌──────────────────────────────────────────────────────────────────────┐
+│  ① RMSNorm              — 归一化层（最小的独立组件）                 │
+│  ② SwiGLUFFN            — SwiGLU 前馈网络（依赖 ①）                │
+│  ③ MultiHeadAttention   — 多头自注意力（依赖 ①）                   │
+│  ④ TransformerBlock     — 一层 Decoder Block（依赖 ① ② ③）        │
+│  ⑤ NovaModel            — 完整模型（依赖 ④，串联所有组件）          │
+│     ├── ⑤a _init_weights   — 权重初始化（在 ⑤ 的构造函数中调用）   │
+│     └── ⑤b print_parameter_summary — 参数量统计（训练前打印）       │
+│                                                                      │
+│  推荐理由:                                                            │
+│    先读 ① 理解归一化原理，它在每层 Block 中被用 2 次、最后还用 1 次; │
+│    再读 ②③ 理解 Block 内部的两个核心计算（FFN 和 Attention）;       │
+│    然后读 ④ 看一层 Block 如何组装这些组件;                            │
+│    最后读 ⑤ 看完整模型如何串联 N 层 Block 完成从 token ID 到 logits。│
+└──────────────────────────────────────────────────────────────────────┘
+
+快速导航（在编辑器中按 Cmd+F / Ctrl+F，搜索以下标记即可跳转）:
+  搜索 "① RMSNorm"            → 归一化层（最小独立组件）
+  搜索 "② SwiGLUFFN"          → SwiGLU 前馈网络
+  搜索 "③ MultiHeadAttention"  → 多头自注意力
+  搜索 "④ TransformerBlock"    → 一层 Decoder Block
+  搜索 "⑤ NovaModel"           → 完整模型
+  搜索 "⑤a"                    → 权重初始化（_init_weights）
+  搜索 "⑤b"                    → 参数量统计（print_parameter_summary）
 """
 
 from __future__ import annotations
@@ -35,366 +61,155 @@ from config import NovaConfig
 
 
 # ======================================================================
-# 步骤 5.1：RMSNorm（Root Mean Square Layer Normalization）
+# 归一化处理
+# Nova这种RMSNorm 被调用了 9 次（每层 Block 调 2 次 × 4 层 + 最终 1 次）
 # ======================================================================
 class RMSNorm(nn.Module):
-    """Nova使用RMSNorm进行归一化处理
-      公式: RMSNorm(x) = x / RMS(x) * gamma，其中 RMS(x) = sqrt(mean(x²) + eps)
+    # Nova使用RMSNorm进行归一化处理
+    #   公式: RMSNorm(x) = x / RMS(x) * gamma，其中 RMS(x) = sqrt(mean(x²) + eps)
 
-      RMS均方根，标准是1，如果向量空间中整体尺度(量级)远大于1，或者远小于1，那就逐元素除以一个数值来整体做尺度的放大或者缩小，
-      保持向量空间的尺度始终在区间1这个标准附近。
+    #   RMS均方根，标准是1，如果向量空间中整体尺度(量级)远大于1，或者远小于1，那就逐元素除以同一个rms数值来做整体尺度的放大或缩小，
+    #   保持向量空间的尺度始终在区间1这个标准附近。
 
-      ======= 解释下，为什么需要做归一化 =======
+    #   ======= 解释下，为什么需要做归一化 =======
 
-    token 的向量会在一层层 Decoder Block 中不断经过自注意力、线性变换、激活函数和残差连接等模块，如果没有归一化，
-    层与层之间的数值尺度就可能越来越不稳定，前向传播时激活值容易失控；而反向传播又需要沿着这条计算链逐层回传梯度，
-    因此梯度也更容易被连续放大或连续压缩，最终导致训练难收敛（loss 不降）、容易震荡（loss 波动不下降），甚至出现梯度爆炸或梯度消失。
+    # token 的向量会在一层层 Decoder Block 中不断经过自注意力、线性变换、激活函数和残差连接等模块，如果没有归一化，
+    # 层与层之间的数值尺度就可能越来越不稳定，前向传播时激活值容易失控；而反向传播又需要沿着这条计算链逐层回传梯度，
+    # 因此梯度也更容易被连续放大或连续压缩，最终导致训练难收敛（loss 不降）、容易震荡（loss 波动不下降），甚至出现梯度爆炸或梯度消失。
 
-    归一化的核心作用，就是在关键计算节点前先把输入向量的整体数值尺度校准到更稳定的范围内，让每一层都尽量工作在可控的数值区间里，从而提升模型训练和推理的稳定性。
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+    # 归一化的核心作用，就是在关键计算节点前先把输入向量的整体数值尺度校准到更稳定的范围内，让每一层都尽量工作在可控的数值区间里，从而提升模型训练和推理的稳定性。
+    def __init__(
+        self,
+        # d_model向量维度
+        dim: int,
+        # 防止输入向量全是0导致除数为0
+        eps: float = 1e-6,
+    ) -> None:
         super().__init__()
         self.eps = eps
-        # gamma 是可学习参数，初始全为 1（即一开始不做缩放，等训练来调整）
-        self.gamma = nn.Parameter(torch.ones(dim))
+        # Pytorch注册了一个d_model维度的gamma一维数组，初始参数全为1。
+        # 在反向传播过程中，模型会根据loss值计算出gamma的梯度值，优化器会根据梯度值和config中预设的超参LR在训练过程中逐步调整gamma参数
+        self.gamma = nn.Parameter(torch.ones(dim))  # Parameter是Tensor的子类
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        调用时机:
-          在 TransformerBlock.forward 中被调用两次：
-            1. 自注意力之前: normed = self.attn_norm(x)
-            2. FFN 之前:     normed = self.ffn_norm(x)
-          在 NovaModel.forward 中被调用一次：
-            3. 所有 Block 之后、输出层之前: x = self.final_norm(x)
-        """
-
         # 计算均方根，先平方、再求平均、再开方。
         rms = torch.sqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
-        # 归一化
+        # 归一化计算
         x_norm = x.float() / rms
 
-        # 乘以可学习参数 gamma，并转回输入的原始 dtype
+        # 解释下为什么归一化后还需要将 输入向量 中的各维度特征进行放大或缩小，
+        # 主要是为了避免整体向量尺度被拉回稳定范围后，部分输入向量的特征数据被一刀抹平
         return (x_norm * self.gamma).type_as(x)
 
 
 # ======================================================================
-# 步骤 5.2：SwiGLU 前馈网络（SwiGLU Feed-Forward Network）
+# FFN前馈网络，Nova使用的是SwiGLU-FFN架构（带门控机制）
+# 前馈网络的本质是强化token的语义特征并删除一些冗余信息，最后再压缩回原向量空间维度，以获得更好的语义特征表达
 # ======================================================================
 class SwiGLUFFN(nn.Module):
-    """SwiGLU 前馈网络 — LLaMA / PaLM 使用的 FFN 变体。
-
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  在 Transformer 中的位置                                         │
-    │                                                                  │
-    │  TransformerBlock 的后半段:                                       │
-    │    x ──→ RMSNorm ──→ 【SwiGLUFFN】──→ + x（残差连接）           │
-    │                       ^^^^^^^^^^^^^                              │
-    │                                                                  │
-    │  每层 Block 有 1 个 SwiGLUFFN，4 层共 4 个实例                    │
-    └──────────────────────────────────────────────────────────────────┘
-
-    SwiGLU 干什么用？
-    ─────────────────
-    自注意力是一场"集体讨论"——每个 token 从其他 token 那里收集了信息。
-    SwiGLU FFN 则是让每个 token **独立地**"消化吸收"这些信息。
-
-    具体做三件事：
-      1. 把 128 维向量扩展到 512 维（展开，留出更多"思考空间"）
-      2. 过一道"智能滤网"，决定哪些信息保留、哪些丢掉
-      3. 再压缩回 128 维（恢复原始维度，传给下一层）
-
-    注意: FFN 对每个位置的向量**独立处理**，位置之间不交互。
-    交互的事在自注意力那一步已经做完了。
-
-    SwiGLU vs 传统 FFN
-    ───────────────────
-    传统 FFN（GPT-2 用的）:
-      output = W2 · ReLU(W1 · x)
-      ReLU 是简单粗暴的滤网: 负数全砍为 0，正数原样通过。
-
-    SwiGLU（LLaMA / Nova 用的）:
-      output = W2 · (SiLU(W1 · x) ⊙ W3 · x)
-      - SiLU（又叫 Swish）: 平滑版的 ReLU，负数不是直接砍掉，
-        而是乘一个很小的系数"压低"，保留微弱的信号
-      - W3 · x 是"门控"信号: 让网络自己学哪些维度该打开、哪些该关闭
-      - ⊙ 是逐元素相乘（门控机制的核心）
-
-    多出来的 W3 让网络有了"自主选择权"——不是机械地砍负数，
-    而是根据输入内容动态决定保留什么。效果更好，但参数量多了 50%。
-
-    三个权重矩阵
-    ────────────
-    W1 (d_model → d_ff):  "展开 + 激活"通路
-       把 128 维扩展到 512 维，然后过 SiLU 激活函数
-
-    W3 (d_model → d_ff):  "门控"通路
-       也是 128→512，但不过激活函数，直接作为"开关系数"
-
-    W2 (d_ff → d_model):  "压缩"通路
-       把 SiLU(W1·x) ⊙ W3·x 的 512 维结果压缩回 128 维
-
-    所有矩阵都不带偏置（bias=False），这是 LLaMA 的做法。
-
-    参数量计算
-    ──────────
-    每个 SwiGLUFFN: 3 × d_model × d_ff = 3 × 128 × 512 = 196,608
-    4 层共: 786,432（占总参数量的大头）
-
-    对比传统 FFN 的 2 × d_model × d_ff = 131,072，多了 50%。
-
-    前向传播计算步骤（以 d_model=4, d_ff=8 为例）
-    ──────────────────────────────────────────────
-    输入 x = [0.5, -0.3, 0.8, 1.2]  (4 维)
-
-    步骤 1：两条通路同时计算
-      gate   = W1 · x → [8个数]  →  SiLU激活  → [8个数, 负值被压低]
-      filter = W3 · x → [8个数]                  [8个数, 原样]
-
-    步骤 2：门控相乘（逐元素）
-      gated = SiLU(W1·x) ⊙ W3·x → [8个数]
-      含义: filter 中的每个维度被 gate 的对应值"调节"——
-            gate 接近 0 的维度被关闭，gate 接近 1 的维度被保留
-
-    步骤 3：压缩回原始维度
-      output = W2 · gated → [4个数]  (回到 d_model 维)
-
-    完整流程图:
-      x ─┬─→ W1 → SiLU ─→ ⊙ ──→ W2 ──→ output
-         │                 ↑
-         └─→ W3 ──────────┘
-    """
-
     def __init__(self, d_model: int, d_ff: int) -> None:
         super().__init__()
-        # W1: "展开 + 激活"通路 (d_model → d_ff)
+
+        # SwiGLU有3个通路，模型会根据loss值计算出W1~W3的梯度值，优化器会根据梯度值和config中预设的超参LR在训练过程中逐步调整W1~W3参数
+
+        # 声明W1、W2、W3通路矩阵
+        # W1: 门控通路 (d_model → d_ff)，数据结构 [d_ff, d_model]
         self.w1 = nn.Linear(d_model, d_ff, bias=False)
-        # W2: "压缩"通路 (d_ff → d_model)
+        # W2: 压缩通路 (d_ff → d_model)，数据结构 [d_model, d_ff]
         self.w2 = nn.Linear(d_ff, d_model, bias=False)
-        # W3: "门控"通路 (d_model → d_ff)
+        # W3: 内容通路 (d_model → d_ff)，数据结构 [d_ff, d_model]
         self.w3 = nn.Linear(d_model, d_ff, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """前向传播：对每个位置的向量独立做 SwiGLU 变换。
+        # 先解释一个概念，SiLU是激活函数(也叫做Swish激活函数)，公式：silu(x) = x × sigmoid(x)
+        # sigmoid(x)是压缩函数，本质就是：大的正数保留，大的负数压到接近零，中间地带按比例衰减
+        #  W1 · x  = [ 1.2,  -0.3,  0.8,  0.5, -2.0,  0.1,  0.3,  -0.7]
+        #               ↓      ↓     ↓     ↓     ↓     ↓     ↓      ↓
+        # SiLU    = [ 0.92, -0.13, 0.55, 0.31, -0.04, 0.05, 0.17, -0.16]
 
-        参数:
-          x : Tensor，形状 [batch_size, seq_len, d_model]
-              例如 [16, 128, 128]
+        # W1通路：非线性变换，将输入向量的d_model维度扩展到d_ff维度的高维向量后进行SiLu激活计算，确认哪些冗余信息是需要删除，哪些要保留
+        gate = F.silu(self.w1(x))
+        # W3通路：单纯的线性变换，将输入向量的d_model维度扩展到d_ff维度的高维向量，相当于扩展后的高维向量的原始内容
+        filt = self.w3(x)
 
-        返回:
-          Tensor，形状与输入相同 [batch_size, seq_len, d_model]
+        # 门控机制，这里做W1和W3的逐元素相乘，因为W1通路的结果本质上是一堆正数和≈0的数，模型语义特征有限
+        # W1和W3做逐元素相乘后，激活值的特征会更丰富，因为会存在大负数的可能性。
+        gated = gate * filt
 
-        调用时机:
-          在 TransformerBlock.forward 的后半段:
-            normed = self.ffn_norm(x)       # 先归一化
-            ffn_out = self.ffn(normed)       # ← 在这里调用
-            x = x + ffn_out                 # 残差连接
-        """
-        # 步骤 1: 两条通路同时计算
-        # SiLU(x) = x * sigmoid(x)，平滑版 ReLU
-        gate = F.silu(self.w1(x))  # [batch, seq_len, d_ff]
-        filt = self.w3(x)  # [batch, seq_len, d_ff]
-
-        # 步骤 2: 门控相乘——gate 控制 filt 中每个维度的"开关"
-        gated = gate * filt  # [batch, seq_len, d_ff]
-
-        # 步骤 3: 压缩回 d_model 维
-        return self.w2(gated)  # [batch, seq_len, d_model]
+        # 压缩回 d_model 维，≈0的激活值跟W2通路矩阵参数乘法后目标位置的激活值也是≈0，没什么用，会被过滤掉
+        # 压缩回d_model维度的输入向量也需要和W2通路的参数进行矩阵乘法，因为压缩方式不同会导致loss值不同
+        return self.w2(gated)
 
 
 # ======================================================================
-# 步骤 5.3：多头自注意力（Multi-Head Self-Attention）
+# 多头自注意力
+# Block中的多头自注意力计算，本质就是将 输入向量*W_Q、W_K、W_V矩阵参数，得到QKV线性投影，
+# 然后进行Q·K 点积 → 缩放（÷√d） → 因果掩码 → softmax → dropout → 加权 V → 新向量，最终得到了融合当前上下文的新向量激活值。
+# 完整流程图:
+#     x ─┬─→ W_Q ──→ Q ─┐
+#        ├─→ W_K ──→ K ─┼─→ Q@K^T/√d ─→ +mask ─→ softmax ─→ drop ─→ ×V ─→ concat ─→ W_O ─→ out
+#        └─→ W_V ──→ V ─┘
 # ======================================================================
 class MultiHeadAttention(nn.Module):
-    """多头自注意力 — Transformer 的核心组件，让 token 之间互相"对话"。
-
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  在 Transformer 中的位置                                         │
-    │                                                                  │
-    │  TransformerBlock 的前半段:                                       │
-    │    x ──→ RMSNorm ──→ 【MultiHeadAttention】──→ + x（残差连接）   │
-    │                       ^^^^^^^^^^^^^^^^^^^^^^                     │
-    │                                                                  │
-    │  每层 Block 有 1 个 MultiHeadAttention，4 层共 4 个实例           │
-    └──────────────────────────────────────────────────────────────────┘
-
-    自注意力干什么用？
-    ─────────────────
-    在 Embedding 之后，每个 token 的向量是"各管各的"——"吗"不知道前面是"好"，
-    "？"不知道自己在一个问句里。自注意力就是让每个 token 去看看其他 token，
-    收集跟自己相关的信息，改写自己的工作向量。
-
-    打个比方：6 个员工坐在会议室里开会，每个人先看看其他人的资料，判断
-    "谁跟我最相关"，然后把最相关的人的信息揉进自己的资料里。
-
-    Q、K、V 三个角色
-    ─────────────────
-    模型有三张变换表（权重矩阵 W_Q、W_K、W_V），每个 token 的向量分别乘以
-    这三张表，变出三个新向量:
-
-      Q (Query，查询):   "我在找什么信息？"
-      K (Key，键):       "我能提供什么信息？"
-      V (Value，值):     "我实际携带的内容"
-
-    Q 和 K 做点积 → 得到关联度分数 → softmax 归一化为百分比 →
-    用百分比对 V 加权求和 → 得到融合了上下文信息的新向量。
-
-    多头机制
-    ────────
-    把 d_model(128) 维拆成 n_heads(4) 个独立的"头"，每个头在
-    head_dim(32) 维的子空间里独立做注意力:
-      - 头 0 可能学会关注语法搭配（"好" → "吗"）
-      - 头 1 可能学会关注语义关系（"名字" → "Nova"）
-      - 头 2 可能学会关注位置关系（相邻的字）
-      - 头 3 可能学会关注标点/结构
-    4 个头的结果拼回 128 维，再过一个输出投影矩阵混合各头信息。
-
-    因果掩码（Causal Mask）
-    ───────────────────────
-    Decoder-Only 模型的关键规则：每个 token 只能看自己和前面的 token，
-    不能偷看后面的。因为推理时模型是逐 token 生成的，生成第 3 个 token 时
-    第 4 个还不存在。
-
-      <s>   只能看: <s>
-      你    只能看: <s>, 你
-      好    只能看: <s>, 你, 好
-      吗    只能看: <s>, 你, 好, 吗
-
-    实现方式：在注意力分数矩阵上，把"未来位置"填成 -inf，softmax 后
-    这些位置的权重变成 0，相当于完全屏蔽。
-
-    缩放（Scaling）
-    ───────────────
-    Q·K 的点积结果会随 head_dim 增大而变大（32 个数相乘再求和，数字很容易
-    飙到几十甚至上百）。如果不缩放，softmax 会把最大值推向 1、其余推向 0，
-    梯度消失。所以除以 √head_dim = √32 ≈ 5.66，把数值拉回合理范围。
-
-    参数说明
-    ────────
-    d_model : int
-        输入/输出向量维度（128）。
-
-    n_heads : int
-        注意力头数（4）。d_model 必须能被 n_heads 整除。
-        head_dim = d_model / n_heads = 32。
-
-    dropout : float
-        注意力权重的 Dropout 概率（训练时随机丢弃部分注意力连接，
-        防止模型过度依赖某些固定的 token 关联）。
-
-    可学习参数
-    ──────────
-    W_Q : nn.Linear(d_model, d_model, bias=False)  权重 [128, 128]
-    W_K : nn.Linear(d_model, d_model, bias=False)  权重 [128, 128]
-    W_V : nn.Linear(d_model, d_model, bias=False)  权重 [128, 128]
-    W_O : nn.Linear(d_model, d_model, bias=False)  权重 [128, 128]
-
-    参数量: 4 × d_model² = 4 × 128² = 65,536（每层）
-    4 层共: 262,144
-
-    前向传播完整流程（d_model=8, n_heads=2, head_dim=4, seq_len=3 为例）
-    ────────────────────────────────────────────────────────────────────
-    输入 x: [batch, 3, 8]  （3 个 token，每个 8 维）
-
-    步骤 1: 线性投影
-      Q = x @ W_Q → [batch, 3, 8]
-      K = x @ W_K → [batch, 3, 8]
-      V = x @ W_V → [batch, 3, 8]
-
-    步骤 2: 拆分多头 (reshape + transpose)
-      Q → [batch, 2, 3, 4]  （2个头，每头看3个token的4维向量）
-      K → [batch, 2, 3, 4]
-      V → [batch, 2, 3, 4]
-
-    步骤 3: 计算注意力分数 (Q @ K^T / √head_dim)
-      scores = Q @ K^T → [batch, 2, 3, 3]  （3×3 的关联度矩阵）
-      scores /= √4 = 2.0
-
-    步骤 4: 应用因果掩码
-      掩码矩阵（上三角为 -inf）:
-        [[0,    -inf, -inf],
-         [0,    0,    -inf],
-         [0,    0,    0   ]]
-      scores += mask  →  未来位置变成 -inf
-
-    步骤 5: Softmax → 注意力权重
-      weights = softmax(scores) → [batch, 2, 3, 3]
-      每行加起来 = 1，-inf 位置变成 0
-
-    步骤 6: Dropout（训练时）
-
-    步骤 7: 加权求和
-      output = weights @ V → [batch, 2, 3, 4]
-
-    步骤 8: 合并多头 (transpose + reshape)
-      output → [batch, 3, 8]  （拼回 d_model 维）
-
-    步骤 9: 输出投影
-      output = output @ W_O → [batch, 3, 8]
-
-    完整流程图:
-      x ─┬─→ W_Q ──→ Q ─┐
-         ├─→ W_K ──→ K ─┼─→ Q@K^T/√d ─→ +mask ─→ softmax ─→ drop ─→ ×V ─→ concat ─→ W_O ─→ out
-         └─→ W_V ──→ V ─┘
-    """
-
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1) -> None:
         super().__init__()
         assert d_model % n_heads == 0, (
             f"d_model({d_model}) 必须能被 n_heads({n_heads}) 整除"
         )
+        # token的向量维度
         self.d_model = d_model
+        # 多头数量
         self.n_heads = n_heads
-        self.head_dim = d_model // n_heads  # 每个头的维度: 128/4 = 32
+        # 每个头负责的token的维度数，我的训练参数是d_model = 384, n_heads = 6，每个头负责 384 / 6 = 64个维度向量
+        self.head_dim = d_model // n_heads  # // python语法只保留整数结果
 
-        # 缩放因子: 1/√head_dim，用于点积注意力的缩放
-        self.scale = self.head_dim**-0.5
-
-        # 四个投影矩阵（全部无偏置，遵循 LLaMA 风格）
+        # 声明 W_Q、W_K、W_V、W_O 四个投影矩阵
+        # bias=False被设置为无偏置，这其实是LLaMA的做法，因为偏置项对模型训练影响不大，去掉可以减少参数
         self.w_q = nn.Linear(d_model, d_model, bias=False)
         self.w_k = nn.Linear(d_model, d_model, bias=False)
         self.w_v = nn.Linear(d_model, d_model, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
 
+        # 为了避免模型特征固化，降低过拟合风险,前向传播过程中会随机将 部分 向量空间的激活值特征置为0
+        # 超参dropout = 0.1，即表示随机丢弃 10% 的数值
+        # 输入:       [0.5, 0.8, 0.3, 0.7, 0.2, 0.9, 0.4, 0.6, 0.1, 0.3]
+        # Dropout后: [0.5, 0.0, 0.3, 0.7, 0.2, 0.0, 0.4, 0.6, 0.1, 0.3]
+        #                  ↑随机变0            ↑随机变0
         self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """前向传播：对输入序列做多头因果自注意力。
-
-        参数:
-          x : Tensor，形状 [batch_size, seq_len, d_model]
-              例如 [16, 128, 128]
-
-        返回:
-          Tensor，形状与输入相同 [batch_size, seq_len, d_model]
-              每个 token 的向量已融合了上下文信息
-
-        调用时机:
-          在 TransformerBlock.forward 的前半段:
-            normed = self.attn_norm(x)       # 先 RMSNorm 归一化
-            attn_out = self.attn(normed)     # ← 在这里调用
-            x = x + attn_out                 # 残差连接
-        """
+        # x.shape会返回Tensor的形状，[batch, seq_len, d_model]三维数组
         batch_size, seq_len, _ = x.shape
 
-        # ── 步骤 1: 线性投影 ──
-        # 每个 token 的 128 维向量分别乘以 W_Q、W_K、W_V，
-        # 得到 Q、K、V 三个 128 维向量
-        q = self.w_q(x)  # [batch, seq_len, d_model]
-        k = self.w_k(x)  # [batch, seq_len, d_model]
-        v = self.w_v(x)  # [batch, seq_len, d_model]
+        # 1、把输入向量全部进行 QKV线性投影
+        # 输入向量中的每个 token 的 n 维向量分别和 W_Q、W_K、W_V做矩阵乘法
+        # 一个token会得到 Q、K、V 3个 新向量[batch, seq_len, d_model]
+        q = self.w_q(x)  # 表示 我在找什么 的[batch, seq_len, d_model]向量空间
+        k = self.w_k(x)  # 表示 我能提供什么 的[batch, seq_len, d_model]向量空间
+        v = self.w_v(x)  # 表示 我实际提供内容 的[batch, seq_len, d_model]向量空间
 
-        # ── 步骤 2: 拆分多头 ──
-        # 把最后一维 d_model 拆成 (n_heads, head_dim):
-        #   [batch, seq_len, d_model] → [batch, seq_len, n_heads, head_dim]
-        # 再 transpose 让 n_heads 提到前面:
-        #   → [batch, n_heads, seq_len, head_dim]
-        # 这样每个头就是一个独立的 [seq_len, head_dim] 矩阵，可以并行计算
+        # 2、多头拆分
+        # 把QKV向量的最后一维 d_model 拆成 (n_heads, head_dim)，即 [batch, seq_len, d_model] → [batch, seq_len, n_heads, head_dim]
+        # 拆之前：[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]    ← 一个8维向量
+        # 拆之后：
+        #   头0: [0.1, 0.2, 0.3, 0.4]    ← 前4个数字
+        #   头1: [0.5, 0.6, 0.7, 0.8]    ← 后4个数字
+
+        # 使用transpose 让索引位1(n_heads)和2(seq_len)交换，数据结构会变成 [batch, seq_len, n_heads, head_dim] → [batch, n_heads, seq_len, head_dim]
+        # 目的是让按token分组变为按注意力头分组，便于后续的并行独立计算。
+        # 交换前（按 token 分组）：
+        #   token0: 头0[0.1,0.2,0.3,0.4], 头1[0.5,0.6,0.7,0.8]
+        #   token1: 头0[...],              头1[...]
+        #   token2: 头0[...],              头1[...]
+
+        # 交换后（按头分组）：
+        #   头0: token0[0.1,0.2,0.3,0.4], token1[...], token2[...]   ← 头0看所有token
+        #   头1: token0[0.5,0.6,0.7,0.8], token1[...], token2[...]   ← 头1看所有token
+        # 交换后每个注意力头拿到的是所有 token 在自己负责的 n 个维度上的数据，可以独立做 Q·K 点积和加权 V
         q = q.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        # 此时 q, k, v: [batch, n_heads, seq_len, head_dim]
 
         # ── 步骤 3-7: FlashAttention (缩放点积 + 因果掩码 + softmax + dropout + 加权求和) ──
         attn_output = F.scaled_dot_product_attention(
@@ -422,8 +237,11 @@ class MultiHeadAttention(nn.Module):
         return self.w_o(attn_output)  # [batch, seq_len, d_model]
 
 
+# ──── ③ 阅读完毕 ──── 下一步请阅读 ④ TransformerBlock ────────────────
+
+
 # ======================================================================
-# 步骤 5.4：TransformerBlock（一层 Decoder Block）
+# ④ TransformerBlock —— 一层 Decoder Block（阅读顺序第 4，依赖 ① ② ③）
 # ======================================================================
 class TransformerBlock(nn.Module):
     """一层 Transformer Decoder Block — Pre-LN（先归一化再计算）结构。
@@ -581,8 +399,11 @@ class TransformerBlock(nn.Module):
         return x
 
 
+# ──── ④ 阅读完毕 ──── 下一步请阅读 ⑤ NovaModel ──────────────────────
+
+
 # ======================================================================
-# 步骤 5.5：NovaModel（完整的 Decoder-Only Transformer 模型）
+# ⑤ NovaModel —— 完整的 Decoder-Only Transformer 模型（阅读顺序第 5，依赖 ④）
 # ======================================================================
 class NovaModel(nn.Module):
     """Nova — 完整的 Decoder-Only Transformer 模型。
@@ -724,11 +545,11 @@ class NovaModel(nn.Module):
         # 把 d_model 维向量映射到 vocab_size 维（每个字一个得分）
         self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        # ── ⑦ 权重初始化（步骤 5.6）──
+        # ── ⑤a 权重初始化 ──
         self._init_weights()
 
     # ------------------------------------------------------------------
-    # 步骤 5.6：权重初始化
+    # ⑤a 权重初始化（在 NovaModel.__init__ 末尾调用）
     # ------------------------------------------------------------------
     def _init_weights(self) -> None:
         """对所有子模块执行权重初始化。
@@ -847,7 +668,7 @@ class NovaModel(nn.Module):
         return logits
 
     # ------------------------------------------------------------------
-    # 步骤 5.7：参数量统计
+    # ⑤b 参数量统计（训练开始前调用，打印各层参数分布）
     # ------------------------------------------------------------------
     def count_parameters(self) -> int:
         """统计总的可学习参数量。"""
@@ -930,3 +751,9 @@ class NovaModel(nn.Module):
         print(f"  {'总计':<{name_width}} {total:>12,}  100.00%")
         print("=" * (name_width + 30))
         print()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ✅ model.py 全部阅读完毕！
+# 建议下一步阅读: train.py — 了解模型是如何被训练的
+# ══════════════════════════════════════════════════════════════════════
