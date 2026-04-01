@@ -18,37 +18,11 @@
 │   │    ├── RMSNorm（①）→ MultiHeadAttention（③）→ 残差              │
 │   │    └── RMSNorm（①）→ SwiGLUFFN（②）→ 残差                      │
 │   ├── RMSNorm（最终归一化）                                          │
-│   └── Linear 输出层: 128维 → vocab_size                             │
+│   └── Linear 输出层: n维 → vocab_size                             │
 │       │                                                             │
 │       ▼                                                             │
 │  输出 logits: [batch_size, seq_len, vocab_size]                     │
 └─────────────────────────────────────────────────────────────────────┘
-
-源码阅读顺序（建议按编号顺序，由内而外阅读）:
-┌──────────────────────────────────────────────────────────────────────┐
-│  ① RMSNorm              — 归一化层（最小的独立组件）                 │
-│  ② SwiGLUFFN            — SwiGLU 前馈网络（依赖 ①）                │
-│  ③ MultiHeadAttention   — 多头自注意力（依赖 ①）                   │
-│  ④ TransformerBlock     — 一层 Decoder Block（依赖 ① ② ③）        │
-│  ⑤ NovaModel            — 完整模型（依赖 ④，串联所有组件）          │
-│     ├── ⑤a _init_weights   — 权重初始化（在 ⑤ 的构造函数中调用）   │
-│     └── ⑤b print_parameter_summary — 参数量统计（训练前打印）       │
-│                                                                      │
-│  推荐理由:                                                            │
-│    先读 ① 理解归一化原理，它在每层 Block 中被用 2 次、最后还用 1 次; │
-│    再读 ②③ 理解 Block 内部的两个核心计算（FFN 和 Attention）;       │
-│    然后读 ④ 看一层 Block 如何组装这些组件;                            │
-│    最后读 ⑤ 看完整模型如何串联 N 层 Block 完成从 token ID 到 logits。│
-└──────────────────────────────────────────────────────────────────────┘
-
-快速导航（在编辑器中按 Cmd+F / Ctrl+F，搜索以下标记即可跳转）:
-  搜索 "① RMSNorm"            → 归一化层（最小独立组件）
-  搜索 "② SwiGLUFFN"          → SwiGLU 前馈网络
-  搜索 "③ MultiHeadAttention"  → 多头自注意力
-  搜索 "④ TransformerBlock"    → 一层 Decoder Block
-  搜索 "⑤ NovaModel"           → 完整模型
-  搜索 "⑤a"                    → 权重初始化（_init_weights）
-  搜索 "⑤b"                    → 参数量统计（print_parameter_summary）
 """
 
 from __future__ import annotations
@@ -62,7 +36,7 @@ from config import NovaConfig
 
 # ======================================================================
 # 归一化处理
-# Nova这种RMSNorm 被调用了 9 次（每层 Block 调 2 次 × 4 层 + 最终 1 次）
+# Nova的RMSNorm 被调用了 9 次（每层 Block 调 2 次 × 4 层 + 最终 1 次）
 # ======================================================================
 class RMSNorm(nn.Module):
     # Nova使用RMSNorm进行归一化处理
@@ -87,9 +61,12 @@ class RMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         self.eps = eps
-        # Pytorch注册了一个d_model维度的gamma一维数组，初始参数全为1。
+        # Pytorch注册了一个d_model维度的gamma一维数组
         # 在反向传播过程中，模型会根据loss值计算出gamma的梯度值，优化器会根据梯度值和config中预设的超参LR在训练过程中逐步调整gamma参数
-        self.gamma = nn.Parameter(torch.ones(dim))  # Parameter是Tensor的子类
+        self.gamma = nn.Parameter(
+            # 初始参数全为1
+            torch.ones(dim)
+        )  # Parameter是Tensor的子类
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 计算均方根，先平方、再求平均、再开方。
@@ -143,7 +120,7 @@ class SwiGLUFFN(nn.Module):
 
 
 # ======================================================================
-# 多头自注意力
+# 多头自注意力计算
 # Block中的多头自注意力计算，本质就是将 输入向量*W_Q、W_K、W_V矩阵参数，得到QKV线性投影，
 # 然后进行Q·K 点积 → 缩放（÷√d） → 因果掩码 → softmax → dropout → 加权 V → 新向量，最终得到了融合当前上下文的新向量激活值。
 # 完整流程图:
@@ -277,12 +254,13 @@ class MultiHeadAttention(nn.Module):
             .view(batch_size, seq_len, self.d_model)
         )
 
-        # 5、W_O投影，把QK*V矩阵的新激活值和W_O矩阵做矩阵乘法，把多头学到的内容相互融合
+        # 5、O投影，把QK*V矩阵的新激活值和W_O矩阵做矩阵乘法，把多头学到的内容相互融合
         return self.w_o(attn_output)
 
 
 # ======================================================================
-# TransformerBlock层，这里主要是串联各层Block和其各子层的计算
+# TransformerBlock层，基于Pre-LN的归一化放置策略
+# RMSNorm → 多头自注意力计算 → 残差连接 → RMSNorm → SwiGLU FFN（前馈网络） → 残差连接
 # ======================================================================
 class TransformerBlock(nn.Module):
     def __init__(
@@ -290,161 +268,41 @@ class TransformerBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        # RMSNorm → 多头自注意力计算 → 残差连接 → RMSNorm → SwiGLU FFN（前馈网络） → 残差连接
-        # ── 前半段子模块：归一化 + 自注意力 ──
+        # RMSNorm、多头自注意力计算、FFN声明
         self.attn_norm = RMSNorm(d_model)
         self.attn = MultiHeadAttention(d_model, n_heads, dropout)
-
-        # ── 后半段子模块：归一化 + 前馈网络 ──
         self.ffn_norm = RMSNorm(d_model)
         self.ffn = SwiGLUFFN(d_model, d_ff)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # ── 前半段：归一化 → 自注意力 → 残差连接 ──
-        # 步骤 A1: 归一化（拉回正常范围）
-        # 步骤 A2: 多头因果自注意力（token 之间交换信息）
-        # 步骤 A3: 残差连接（原始 x + 注意力输出）
+        # 1、先做RMSNorm -> 多头自注意力计算 -> 残差连接
         x = x + self.attn(self.attn_norm(x))
 
-        # ── 后半段：归一化 → 前馈网络 → 残差连接 ──
-        # 步骤 B1: 归一化
-        # 步骤 B2: SwiGLU FFN（每个 token 独立消化信息）
-        # 步骤 B3: 残差连接
+        # 2、再做RMSNorm -> FFN -> 残差连接
         x = x + self.ffn(self.ffn_norm(x))
-
         return x
 
 
-# ──── ④ 阅读完毕 ──── 下一步请阅读 ⑤ NovaModel ──────────────────────
-
-
 # ======================================================================
-# ⑤ NovaModel —— 完整的 Decoder-Only Transformer 模型（阅读顺序第 5，依赖 ④）
+# Decoder-Only Transformer 模型，做工作流串联
+# Token Embedding -> Position Embedding -> Dropout -> TransformerBlock × n_layers 层 -> Final RMSNorm -> Output Linear
 # ======================================================================
 class NovaModel(nn.Module):
-    """Nova — 完整的 Decoder-Only Transformer 模型。
-
-    这是整个模型的"总指挥"，把前面所有子组件串起来，完成从
-    "整数 token ID" 到 "每个位置对词表的概率预测（logits）" 的完整变换。
-
-    ┌──────────────────────────────────────────────────────────────────┐
-    │                    完整前向传播数据流                               │
-    │                                                                  │
-    │  训练阶段（train.py 调用）:                                       │
-    │    input_ids = batch["input_ids"]           # [batch, seq_len]   │
-    │    logits = model(input_ids)                # ← 调用本类         │
-    │    loss = CrossEntropyLoss(logits, targets)                      │
-    │    loss.backward()                                               │
-    │                                                                  │
-    │  推理阶段（chat.py 调用）:                                        │
-    │    logits = model(input_ids)                # ← 调用本类         │
-    │    next_token = sample(logits[:, -1, :])    # 只看最后一个位置    │
-    │                                                                  │
-    │  ┌──────────────────────────────────────────────────────────┐     │
-    │  │                model.forward(input_ids) 内部:            │     │
-    │  │                                                          │     │
-    │  │  input_ids: [batch, seq_len]                             │     │
-    │  │       │                                                  │     │
-    │  │  ① Token Embedding: 查字义表                             │     │
-    │  │       token_emb = self.token_emb(input_ids)              │     │
-    │  │       → [batch, seq_len, d_model]                        │     │
-    │  │       │                                                  │     │
-    │  │  ② Position Embedding: 查位置表                          │     │
-    │  │       pos_emb = self.pos_emb(positions)                  │     │
-    │  │       → [seq_len, d_model]                               │     │
-    │  │       │                                                  │     │
-    │  │  ③ 相加: x = token_emb + pos_emb                        │     │
-    │  │       每个 token 既知道"它是谁"也知道"它在哪"            │     │
-    │  │       → [batch, seq_len, d_model]                        │     │
-    │  │       │                                                  │     │
-    │  │  ④ Dropout: 防过拟合                                     │     │
-    │  │       │                                                  │     │
-    │  │  ⑤ TransformerBlock × n_layers 层                        │     │
-    │  │       每层: RMSNorm→Attention→+x→RMSNorm→FFN→+x         │     │
-    │  │       → [batch, seq_len, d_model]                        │     │
-    │  │       │                                                  │     │
-    │  │  ⑥ Final RMSNorm: 最后一次归一化                         │     │
-    │  │       → [batch, seq_len, d_model]                        │     │
-    │  │       │                                                  │     │
-    │  │  ⑦ Output Linear: d_model → vocab_size                  │     │
-    │  │       → [batch, seq_len, vocab_size]                     │     │
-    │  │       │                                                  │     │
-    │  │       ▼                                                  │     │
-    │  │  logits（每个位置对词表中每个字的"得分"）                 │     │
-    │  └──────────────────────────────────────────────────────────┘     │
-    └──────────────────────────────────────────────────────────────────┘
-
-    Token Embedding（字义表）
-    ────────────────────────
-    一张 vocab_size × d_model 的查找表（例如 ~1000 × 128）。
-    每一行对应一个 token（字/特殊标记），存储该 token 的 128 维语义向量。
-
-    初始时随机填充（N(0, 0.02)），训练过程中通过反向传播不断更新——
-    意思相近的字的向量会逐渐靠近，意思不同的会远离。
-
-    查表操作: token_emb(input_ids)
-      input_ids = [1, 42, 15]  →  查第 1、42、15 行
-      返回 3 个 128 维向量（拼成 [3, 128] 的矩阵）
-
-    Position Embedding（位置表）
-    ──────────────────────────
-    一张 max_seq_len × d_model 的查找表（128 × 128）。
-    第 i 行存储"在位置 i"这个信息的 128 维向量。
-
-    为什么需要？Transformer 的自注意力是"无序"的——它只看内容，不看顺序。
-    如果不加位置信息，"你好吗" 和 "吗好你" 对模型来说是一样的。
-    加上位置嵌入后，同一个字在不同位置会得到不同的向量（字义 + 位置信息），
-    模型就能区分顺序了。
-
-    两个嵌入相加
-    ────────────
-    x = token_emb + pos_emb
-
-    例如 "你" 在位置 1:
-      字义向量: [0.12, -0.34, 0.56, ...]   ← "你"是谁
-      位置向量: [0.04, -0.01, 0.05, ...]   ← 它在第 1 位
-      ────────────────────────────────────
-      相加得到: [0.16, -0.35, 0.61, ...]   ← 既知道是"你"，也知道在第 1 位
-
-    输出层
-    ──────
-    最终的 Linear 层把 128 维向量映射到 vocab_size 维:
-      128 个数字 → ~1000 个数字（每个数字是对应字的"得分"）
-
-    训练时用 CrossEntropyLoss 和 target_ids 计算损失。
-    推理时取最后一个位置的 logits 做 softmax 采样下一个字。
-
-    参数量总览
-    ──────────
-    假设 vocab_size = 1000:
-      Token Embedding:    1000 × 128              = 128,000
-      Position Embedding: 128 × 128               = 16,384
-      TransformerBlock × 4: 4 × 262,400           = 1,049,600
-      Final RMSNorm:      128                     = 128
-      Output Linear:      128 × 1000              = 128,000
-      ──────────────────────────────────────────────────────
-      总计:               ~1,322,112（约 1.3M 参数）
-    """
-
     def __init__(self, config: NovaConfig) -> None:
         super().__init__()
         self.config = config
 
-        # ── ① Token Embedding: 字义表 ──
-        # vocab_size 行，每行 d_model 维
-        # 把整数 token ID 映射为稠密向量
+        # 初始化token_embedding
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
 
-        # ── ② Position Embedding: 位置表 ──
-        # max_seq_len 行，每行 d_model 维
-        # 把位置编号 0, 1, 2, ... 映射为位置向量
+        # 初始化position_embedding
         self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
 
-        # ── ③ Dropout: 嵌入层之后的正则化 ──
+        # 初始化dropout,这个和多头自注意力计算中丢的东西不同
+        # 多头自注意力计算中丢的是softmax计算后的注意力权重，这里丢的是最初输入向量的部分维度
         self.emb_dropout = nn.Dropout(config.dropout)
 
-        # ── ④ N 层 TransformerBlock ──
-        # ModuleList 让 PyTorch 知道这些是子模块（参数会被自动注册）
+        # 将4层TransformerBlock注册到pytorch上
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
@@ -454,137 +312,77 @@ class NovaModel(nn.Module):
             ]
         )
 
-        # ── ⑤ Final RMSNorm: 所有 Block 之后、输出层之前的最终归一化 ──
+        # 声明RMSNorm，这里是在所有TransformerBlock之后，输出层之前执行的final归一化操作
         self.final_norm = RMSNorm(config.d_model)
 
-        # ── ⑥ Output Linear: 输出投影层 ──
-        # 把 d_model 维向量映射到 vocab_size 维（每个字一个得分）
+        # 声明Output Linear输出投影层
         self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        # ── ⑤a 权重初始化 ──
+        # 执行各个模型参数的初始化
         self._init_weights()
 
     # ------------------------------------------------------------------
-    # ⑤a 权重初始化（在 NovaModel.__init__ 末尾调用）
+    # 模型各个参数的初始化动作
     # ------------------------------------------------------------------
     def _init_weights(self) -> None:
-        """对所有子模块执行权重初始化。
-
-        为什么要做初始化？
-        ─────────────────
-        PyTorch 默认的初始化方式（nn.Linear 用 Kaiming Uniform，nn.Embedding
-        用 N(0,1)）对 Transformer 来说不一定最优。好的初始化能让：
-          1. 训练初期 loss 下降更快（参数起点离最优点更近）
-          2. 梯度大小合理（不暴涨也不消失）
-          3. 各层输出的数值范围一致（不会出现某层输出极大/极小）
-
-        本项目的初始化策略（与 GPT-2 / LLaMA 一致）
-        ──────────────────────────────────────────────
-        1. nn.Embedding（字义表 + 位置表）：
-             正态分布 N(0, 0.02)
-             为什么不用默认的 N(0,1)？
-             → 标准差 1 太大，128 维向量的 L2 范数会很大（约 √128 ≈ 11），
-               导致嵌入层输出数值过大，后续计算不稳定。
-               0.02 使范数约 0.02×√128 ≈ 0.23，温和得多。
-
-        2. nn.Linear（所有投影矩阵：Q/K/V/O、FFN 的 W1/W2/W3、输出层）：
-             Xavier 均匀分布: U(-√(6/(fan_in+fan_out)), √(6/(fan_in+fan_out)))
-             核心思想：让输入和输出的方差保持一致。
-             例如 W_Q [128, 128]：范围约 ±0.153
-             例如 FFN W1 [128, 512]：范围约 ±0.097
-
-        3. RMSNorm 的 gamma：
-             全 1 初始化（已在 RMSNorm.__init__ 中完成）。
-             初始时归一化后不做任何缩放，等训练来调整。
-
-        调用时机:
-          在 NovaModel.__init__ 的最后一步:
-            self._init_weights()
-          即模型构造完成后、第一次 forward 之前，统一做一遍初始化。
-        """
         for module in self.modules():
             if isinstance(module, nn.Embedding):
-                # 嵌入层: N(0, 0.02)
+                # nn.embedding初始化
+                # 把 embedding 表里的每个值，用均值为 0、标准差为 0.02 的正态分布随机填充。大部分初始值会落在 -0.04 ~ 0.04 之间（2 倍标准差范围）：
+                # 初始化前：[0, 0, 0, 0, ...]           ← 空的
+                # 初始化后：[0.01, -0.03, 0.02, -0.01, ...]  ← 很小的随机数
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
             elif isinstance(module, nn.Linear):
-                # 线性层: Xavier 均匀分布
-                nn.init.xavier_uniform_(module.weight)
+                # MultiHeadAttention 里的:  w_q, w_k, w_v, w_o  → 都是 nn.Linear → Xavier 初始化
+                # SwiGLUFFN 里的:          w1, w2, w3           → 都是 nn.Linear → Xavier 初始化
+                # Output 输出层:           self.output          → 也是 nn.Linear → Xavier 初始化
+                # RMSNorm 的 gamma 已在其 __init__ 中初始化为全 1
+                nn.init.xavier_uniform_(
+                    module.weight
+                )  # 初始化会根据每层矩阵的输入和输出维度，自动计算一个合适的随机范围来填充初始权重
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-            # RMSNorm 的 gamma 已在其 __init__ 中初始化为全 1，无需再处理
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """前向传播：从 token ID 到 logits 的完整变换。
-
-        参数:
-          input_ids : LongTensor，形状 [batch_size, seq_len]
-              例如 [16, 128]，每个元素是 0~vocab_size-1 的整数
-              来源: dataset.py 中 NovaDataset 生成的 "input_ids" 字段
-
-        返回:
-          Tensor，形状 [batch_size, seq_len, vocab_size]
-              每个位置对词表中每个字的"得分"（未经 softmax 的 raw logits）
-
-        调用链路:
-          训练阶段 (train.py):
-            for batch in dataloader:
-                input_ids = batch["input_ids"]                  # [batch, seq_len]
-                target_ids = batch["target_ids"]                # [batch, seq_len]
-                logits = model(input_ids)                       # ← 本方法
-                loss = F.cross_entropy(
-                    logits.view(-1, vocab_size),
-                    target_ids.view(-1),
-                    ignore_index=-100,
-                )
-                loss.backward()
-
-          推理阶段 (chat.py):
-            logits = model(input_ids)                           # ← 本方法
-            next_token_logits = logits[:, -1, :]                # 最后位置的得分
-            next_token_id = top_k_sample(next_token_logits)     # 采样下一个字
-        """
+        # seq_len表示当前这个序列有多少个 token
         batch_size, seq_len = input_ids.shape
 
-        # ── 步骤 1: Token Embedding（查字义表）──
-        # 每个整数 ID 查出对应的 128 维向量
-        # input_ids: [batch, seq_len] → token_emb: [batch, seq_len, d_model]
+        # 根据input_ids，查询token_embedding表，得到每一个token的token_emb([batch, seq_len, d_model]三维数组)
         token_emb = self.token_emb(input_ids)
 
-        # ── 步骤 2: Position Embedding（查位置表）──
-        # 生成位置编号 [0, 1, 2, ..., seq_len-1]
-        # 每个位置编号查出对应的 128 维位置向量
+        # 生成position_embedding的查询索引，表示形式为一维数组[0, 1, 2, ..., seq_len-1]
         positions = torch.arange(seq_len, device=input_ids.device)
-        pos_emb = self.pos_emb(positions)  # [seq_len, d_model]，广播加到每个 batch
+        # 拿每一个positions[id]去查position_embedding，得到每一个token的position_emb([seq_len, d_model]二维数组)
+        pos_emb = self.pos_emb(positions)
 
-        # ── 步骤 3: 字义 + 位置 = 初始工作向量 ──
-        # 从这一步开始，模型不再看原始文字了，后续全部在操作这些向量
-        x = token_emb + pos_emb  # [batch, seq_len, d_model]
+        # token_embedding+position_embedding构成最初的输入向量
+        # 数据结构为[batch, seq_len, d_model]三维数组
+        x = token_emb + pos_emb
 
-        # ── 步骤 4: Dropout ──
-        # 训练时随机丢弃一部分嵌入维度，迫使模型不过度依赖某几个特征
+        # 训练前随机丢弃一部分嵌入维度，迫使模型不过度依赖某几个特征，避免过拟合
         x = self.emb_dropout(x)
 
-        # ── 步骤 5: N 层 TransformerBlock ──
-        # 每层做一次"讨论 + 消化":
-        #   第 0 层: 学字符搭配（"好吗"经常连在一起）
-        #   第 1 层: 学句法结构（这是一个问句）
-        #   第 2 层: 学语义（有人在问候我）
-        #   第 3 层: 学意图（我应该用问候语回答）
+        # 执行4层TransformerBlock计算,堆叠层数越深，模型对语义的理解会越深，训练效果越好
         for block in self.blocks:
-            x = block(x)  # [batch, seq_len, d_model] → [batch, seq_len, d_model]
+            x = block(x)  # [batch, seq_len, d_model]
 
-        # ── 步骤 6: Final RMSNorm ──
-        # 4 层 Block 处理完后，数值可能又飘了，最后归一化一次
+        # 最终RMSNorm归一化,保持向量空间的尺度最终稳定
         x = self.final_norm(x)  # [batch, seq_len, d_model]
 
-        # ── 步骤 7: 输出投影层 ──
-        # 把 128 维向量映射到 vocab_size 维（每个字一个得分）
+        # 输出投影层
+        # 每一句话中的每一个token都有一个vocab_size的打分表
+        # 位置2(好)的向量: [0.45, 0.22, 0.11, ..., -0.05]   ← 这个向量"知道"前面是<s>你好
+        #     ↓
+        # × output权重矩阵 (d_model → vocab_size)
+        #     ↓
+        # vocab_size个分数: [<s>:-0.8, 你:1.3, 好:0.5, 吗:9.2, ...]  → 预测下一个是"吗"
+        # Block层让每个 token 融合上下文得到 384 维的新向量，然后输出投影层和每个 token 的 384 维向量做矩阵乘法，
+        #   得到 vocab_size 个分数，这些分数表示该位置下一个 token 最可能的打分。
         logits = self.output(x)  # [batch, seq_len, vocab_size]
-
         return logits
 
     # ------------------------------------------------------------------
-    # ⑤b 参数量统计（训练开始前调用，打印各层参数分布）
+    # 参数量统计（训练开始前调用，打印各层参数分布）
     # ------------------------------------------------------------------
     def count_parameters(self) -> int:
         """统计总的可学习参数量。"""
@@ -667,9 +465,3 @@ class NovaModel(nn.Module):
         print(f"  {'总计':<{name_width}} {total:>12,}  100.00%")
         print("=" * (name_width + 30))
         print()
-
-
-# ══════════════════════════════════════════════════════════════════════
-# ✅ model.py 全部阅读完毕！
-# 建议下一步阅读: train.py — 了解模型是如何被训练的
-# ══════════════════════════════════════════════════════════════════════
