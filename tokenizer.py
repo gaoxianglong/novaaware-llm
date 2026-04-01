@@ -14,13 +14,6 @@
   ③ 解码（推理时调用）
   ④ 加载已有分词器（推理时直接加载，跳过 ① ②）
 
-特殊 token 及其固定 ID（永远不变）:
-  <pad> = 0   填充符，训练时把短序列补齐到统一长度
-  <s>   = 1   序列开始标记
-  <e>   = 2   序列结束标记（模型生成到这个 token 就停下来）
-  <sep> = 3   问题和回答之间的分隔符
-  <unk> = 4   未知字符（分词器无法处理的输入用这个代替）
-
   一条完整对话的 token 序列示例:
     问题: "你好吗？"  回答: "我很好"
     → [1, 42, 15, 88, 7, 3, 56, 23, 91, 2]
@@ -37,14 +30,19 @@ from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 
 
 # 5 个特殊 token 的名称和固定 ID
+# 填充符，训练时把短序列补齐到统一长度
 PAD_TOKEN, PAD_ID = "<pad>", 0
+# 序列开始标记
 BOS_TOKEN, BOS_ID = "<s>", 1
+# 序列结束标记（模型生成到这个 token 就停下来）
 EOS_TOKEN, EOS_ID = "<e>", 2
+# 问题和回答之间的分隔符
 SEP_TOKEN, SEP_ID = "<sep>", 3
+# 未知字符（分词器无法处理的输入用这个代替）
 UNK_TOKEN, UNK_ID = "<unk>", 4
 
 SPECIAL_TOKENS = [PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, SEP_TOKEN, UNK_TOKEN]
-NUM_SPECIAL = len(SPECIAL_TOKENS)  # 5，普通子词从 ID=5 开始编号
+NUM_SPECIAL = len(SPECIAL_TOKENS)  # 普通子词从 ID=5 开始编号
 
 
 class NovaTokenizer:
@@ -53,30 +51,24 @@ class NovaTokenizer:
         self.vocab_size: int = 0
 
     # ------------------------------------------------------------------
-    # ① train_from_texts —— 从文本列表训练 BPE 分词器
+    # BPE分词训练
+    # 创建 BPE 模型 -> 配置预分词器 -> 配置解码器 -> 创建 BPE 训练器 -> 执行 BPE 训练 -> 保存内部引用并更新 vocab_size
     # ------------------------------------------------------------------
     def train_from_texts(
         self,
+        # 语料文本列表
+        # 预训练: ["一段长文本...", "另一段文本...", ...]
+        # 微调:   ["问题1回答1", "问题2回答2", ...]
         texts: List[str],
         # 词表大小的上限，超过这个值后，训练器会停止合并子词
         # 小于则以最终合并的子词为准
         vocab_size: int = 8000,
     ) -> None:
-        """从文本列表训练 BPE 分词器。
-
-        输入:
-          texts      — 语料文本列表
-                       预训练: ["一段长文本...", "另一段文本...", ...]
-                       微调:   ["问题1回答1", "问题2回答2", ...]
-          vocab_size — 目标词表大小（含 5 个特殊 token），默认 8000
-
-        输出: 无返回值；内部构建 self._tokenizer 并填充映射表
-        """
-        # ── 步骤 1: 创建 BPE 模型 ──
+        # 1、创建 BPE 模型
         # 设置后续推理时遇见未知Unicode字符就用 token <unk>代替
         tokenizer = Tokenizer(models.BPE(unk_token=UNK_TOKEN))
 
-        # ── 步骤 2: 配置预分词器 ──
+        # 2、配置预分词器
         # 粗切，把一段语料文本切成若干段，后续进行token化
         # 按 Unicode 脚本边界（不同语言交接的地方） + 数字 + 标点符号进行初步切分
         # 这样中文字符、英文单词、数字、标点会被分到不同的组
@@ -89,7 +81,7 @@ class NovaTokenizer:
                 #   "我今天很" | "happy" | "，" | "你" | "happy" | "吗"
                 #    Han        Latin     Common  Han   Latin     Han
                 pre_tokenizers.UnicodeScripts(),
-                # 除了按书写边界切分外，还要指定预分词器组合空格切分，这主要是给英文这种基于空格分词的语言使用的
+                # 除了按脚本边界、数字、标点符号切分外，还要指定预分词器组合空格切分，这主要是给英文这种基于空格分词的语言使用的
                 # 如果使用空格分词的语言不加上空格切分，会出现一些跨单词的无意义的组合，比如love you，会组合成e y。
                 # Whitespace 切分（在每段内部再按空格切）:
                 #   这个例子里没有空格，所以结果不变:
@@ -98,12 +90,12 @@ class NovaTokenizer:
             ]
         )
 
-        # ── 步骤 3: 配置解码器 ──
+        # 3、配置解码器
         # 这里用的是Fuse解码器，会把所有相邻的token拼接成一个字符串，比如：[156, 2847] → ["Nova", "可爱"] → “Nova可爱”
         # Fuse解码器在拼接字符串的时候，采用的是直接拼接，不会在token之间加任何的分隔符，比如英文的空格
         tokenizer.decoder = decoders.Fuse()
 
-        # ── 步骤 4: 创建 BPE 训练器 ──
+        # 4、创建 BPE 训练器
         # 这一步主要是从语料中学习子词和词组的合并规则
         trainer = trainers.BpeTrainer(
             vocab_size=vocab_size,
@@ -115,19 +107,19 @@ class NovaTokenizer:
             min_frequency=2,
         )
 
-        # ── 步骤 5: 执行 BPE 训练 ──
-        # BPE 训练会进行 N 轮，每一轮全量扫描语料中的所有内容，找到频率最高的一组 token 对作为一条 merge 规则存下来，直至满足任意一个条件时停止：
+        # 5、执行 BPE 训练
+        # BPE 训练会进行 N 轮，每一轮全量扫描语料中的所有内容，找到频率最高的一组 token对 作为一条 merge 规则存下来，直至满足任意一个条件时停止：
         # 1、所有候选 token对 的频率 < min_frequency
         # 2、词表大小 = vocab_size 上限
         tokenizer.train_from_iterator(texts, trainer=trainer)
 
-        # ── 步骤 6: 保存内部引用并更新 vocab_size ──
+        # 6、保存内部引用并更新 vocab_size
         self._tokenizer = tokenizer
         # 更新实际词表大小
         self.vocab_size = self._tokenizer.get_vocab_size()
 
     # ------------------------------------------------------------------
-    # ② encode —— 把文本变成 token_id 列表（推理使用）
+    # 文本序列 -> token_ids（仅推理使用）
     # ------------------------------------------------------------------
 
     # 推理时，编码器先把文本拆成单字符序列，然后按 merges 的顺序（从第 1 条到最后一条）逐条检查并合并，合并完成后，再查词表把每个 字符 转成对应的 token ID。
@@ -148,7 +140,7 @@ class NovaTokenizer:
         return self._tokenizer.encode(text).ids
 
     # ------------------------------------------------------------------
-    # ③ decode —— 推理的时候把 token_id 列表还原成文本序列
+    # token_ids -> 文本序列（仅推理使用）
     # ------------------------------------------------------------------
     def decode(self, ids: List[int]) -> str:
         if not ids:
@@ -168,7 +160,7 @@ class NovaTokenizer:
         return self._tokenizer.decode(filtered)
 
     # ------------------------------------------------------------------
-    # ④ save —— 将分词器持久化到磁盘，输出data/tokenizer.json
+    # 将分词器持久化到磁盘，输出data/tokenizer.json
     # ------------------------------------------------------------------
     def save(self, path: str) -> None:
         if self._tokenizer is None:
@@ -177,7 +169,7 @@ class NovaTokenizer:
         self._tokenizer.save(path)
 
     # ------------------------------------------------------------------
-    # ⑤ load —— 推理时从磁盘加载已有分词器
+    # 推理时从磁盘加载已有分词器
     # ------------------------------------------------------------------
     def load(self, path: str) -> None:
         # 加载已经训练好的BPE分词器
