@@ -51,7 +51,7 @@ class PretrainDataset(Dataset):
         n = len(texts)
 
         # NumPy是Python中高性能数值数组运算的基础库
-        # input_ids是模型的输入，target_ids是交叉熵的输入，CrossEntropyLoss有个参数叫ignore_index，默认值就是-100损失函数遇到 -100 就跳过
+        # input_ids是模型的输入，target_ids是交叉熵的输入，CrossEntropyLoss有个参数叫ignore_index，默认值就是-100,损失函数遇到 -100 就跳过
         # 预先创建input_ids的全0矩阵，以及target_ids的全-100矩阵，提前完成了填充
         # 最终填充后的效果：
         # 位置索引:     0    1    2    3    4    5    6    7
