@@ -11,8 +11,8 @@
 │       │                                                             │
 │       ▼                                                             │
 │  NovaModel（完整模型，⑤）                                           │
-│   ├── Token Embedding    查字义表: token ID → 128维向量              │
-│   ├── Position Embedding 查位置表: 位置编号 → 128维向量              │
+│   ├── Token Embedding    查字义表: token ID → n维向量              │
+│   ├── Position Embedding 查位置表: 位置编号 → n维向量              │
 │   ├── Dropout                                                       │
 │   ├── TransformerBlock × 4 层（④）                                   │
 │   │    ├── RMSNorm（①）→ MultiHeadAttention（③）→ 残差              │
@@ -359,7 +359,7 @@ class NovaModel(nn.Module):
         # 数据结构为[batch, seq_len, d_model]三维数组
         x = token_emb + pos_emb
 
-        # 训练前随机丢弃一部分嵌入维度，迫使模型不过度依赖某几个特征，避免过拟合
+        # 每次训练进入Block前随机丢弃一部分嵌入维度，迫使模型不过度依赖某几个特征，避免过拟合
         x = self.emb_dropout(x)
 
         # 执行4层TransformerBlock计算,堆叠层数越深，模型对语义的理解会越深，训练效果越好
@@ -389,9 +389,7 @@ class NovaModel(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def print_parameter_summary(self) -> None:
-        """打印各层参数量的详细统计。
-
-        输出示例:
+        """
         ┌──────────────────────────────────────────────────────────┐
         │  Nova 模型参数统计                                        │
         ├────────────────────────────────┬───────────┬─────────────┤
