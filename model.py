@@ -376,7 +376,7 @@ class NovaModel(nn.Module):
         # × output权重矩阵 (d_model → vocab_size)
         #     ↓
         # vocab_size个分数: [<s>:-0.8, 你:1.3, 好:0.5, 吗:9.2, ...]  → 预测下一个是"吗"
-        # Block层让每个 token 融合上下文得到 384 维的新向量，然后输出投影层和每个 token 的 384 维向量做矩阵乘法，
+        # Block层让每个 token 融合上下文得到 n 维的新向量，然后输出投影层和每个 token 的 n 维向量做矩阵乘法，
         #   得到 vocab_size 个分数，这些分数表示该位置下一个 token 最可能的打分,这里是原始数据，后面会用softmax计算出概率分布。
         logits = self.output(x)  # [batch, seq_len, vocab_size]
         return logits
