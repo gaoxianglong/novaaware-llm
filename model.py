@@ -335,7 +335,7 @@ class NovaModel(nn.Module):
             elif isinstance(module, nn.Linear):
                 # MultiHeadAttention 里的:  w_q, w_k, w_v, w_o  → 都是 nn.Linear → Xavier 初始化
                 # SwiGLUFFN 里的:          w1, w2, w3           → 都是 nn.Linear → Xavier 初始化
-                # Output 输出层:           self.output          → 也是 nn.Linear → Xavier 初始化
+                # Output 输出层投影矩阵:     self.output          → 也是 nn.Linear → Xavier 初始化
                 # RMSNorm 的 gamma 已在其 __init__ 中初始化为全 1
                 nn.init.xavier_uniform_(
                     module.weight
