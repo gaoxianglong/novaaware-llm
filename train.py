@@ -1,44 +1,13 @@
 """Nova 训练流程（支持预训练 + 微调两阶段）
 
-把前面所有组件串起来，完成"从原始文本到训练好的模型"的完整过程。
-这是整个项目的"总调度中心"——分词器、数据集、模型、优化器都在这里汇合。
+用法:
+   # 预训练
+   .venv/bin/python train.py --mode pretrain
+   .venv/bin/python train.py --mode pretrain --data data/pretrain/
 
-┌──────────────────────────────────────────────────────────────────────┐
-│                       两阶段训练流程                                    │
-│                                                                      │
-│  阶段 1: 预训练（学语言）                                              │
-│  ────────────────────────                                            │
-│  运行: .venv/bin/python train.py --mode pretrain                     │
-│                                                                      │
-│  ┌───────────────────────────────────────────────────────────────┐   │
-│  │ ① 加载预训练数据 (data/pretrain/*.jsonl)                       │   │
-│  │ ② 训练 BPE 分词器 → 保存 data/tokenizer.json                  │   │
-│  │ ③ 创建 PretrainDataset + DataLoader                           │   │
-│  │ ④ 创建模型（随机初始化）                                       │   │
-│  │ ⑤ 创建优化器                                                   │   │
-│  │ ⑥ 训练循环 → 保存 checkpoint                                   │   │
-│  │                                                                │   │
-│  │ 产出: data/tokenizer.json + checkpoints/best_model.pt          │   │
-│  └───────────────────────────────────────────────────────────────┘   │
-│                           │                                          │
-│                           ▼                                          │
-│  阶段 2: 微调（学对话）                                              │
-│  ────────────────────────                                            │
-│  运行: .venv/bin/python train.py --mode finetune                     │
-│        --resume checkpoints/best_model.pt                            │
-│                                                                      │
-│  ┌───────────────────────────────────────────────────────────────┐   │
-│  │ ① 加载微调数据 (data/sft/*.jsonl)                              │   │
-│  │ ② 加载已有 BPE 分词器 (data/tokenizer.json)                    │   │
-│  │ ③ 创建 NovaDataset + DataLoader                               │   │
-│  │ ④ 创建模型                                                     │   │
-│  │ ⑤ 创建优化器                                                   │   │
-│  │ ⑥ 加载预训练 checkpoint（模型权重 + 优化器状态）                 │   │
-│  │ ⑦ 训练循环 → 保存微调后的 checkpoint                            │   │
-│  │                                                                │   │
-│  │ 产出: checkpoints/best_model.pt（可用于推理）                   │   │
-│  └───────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────┘
+   # SFT微调
+   .venv/bin/python train.py --mode finetune --resume checkpoints/best_model.pt
+   .venv/bin/python train.py --mode finetune --data data/sft/
 """
 
 from __future__ import annotations
@@ -66,65 +35,28 @@ from model import NovaModel
 
 
 # ======================================================================
-# 学习率调度器（Warmup + Cosine Decay）
+# 动态计算学习率LR值
 # ======================================================================
 def get_lr(
     step: int,
     warmup_steps: int,
     max_steps: int,
+    # 超参中的LR参数值
     max_lr: float,
     min_lr: float = 1e-6,
 ) -> float:
-    """计算当前 step 的学习率。
-
-    整个学习率曲线分两个阶段:
-
-      学习率
-      ▲
-      │        ╭─────╮
-      │       ╱       ╲        Cosine Decay 阶段
-      │      ╱         ╲       （从 max_lr 平滑下降到 min_lr）
-      │     ╱           ╲
-      │    ╱             ╲
-      │   ╱               ╲
-      │  ╱                 ╲
-      │ ╱                   ╲──── min_lr
-      │╱                    │
-      ├─────┬───────────────┤──→ step
-      0   warmup          max_steps
-
-    阶段 1: Warmup（热身，step 0 → warmup_steps）
-      学习率从 0 线性增长到 max_lr。
-
-    阶段 2: Cosine Decay（余弦衰减，warmup_steps → max_steps）
-      学习率按余弦曲线从 max_lr 平滑下降到 min_lr。
-
-    参数:
-      step         — 当前训练步数（epoch 编号）
-      warmup_steps — 热身阶段的步数
-      max_steps    — 总训练步数
-      max_lr       — 最大学习率
-      min_lr       — 最小学习率（默认 1e-6）
-
-    返回:
-      当前 step 应使用的学习率（float）
-
-    调用时机:
-      在训练循环中，每个 epoch 开始时调用一次:
-        lr = get_lr(epoch, config.warmup_steps, config.epochs, config.learning_rate)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-    """
+    # 1、预热阶段：epoch < warmup_steps，学习率从 0 线性增长到 max_lr
     if step < warmup_steps:
         return max_lr * step / warmup_steps
 
+    # 2、余弦衰减阶段：epoch >= warmup_steps，lr 从 max_lr 平滑下降到 min_lr
     decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
 
 # ======================================================================
-# 训练日志格式化
+# 训练日志格式化，快速浏览即可
 # ======================================================================
 def format_train_log(
     epoch: int,
@@ -133,27 +65,22 @@ def format_train_log(
     lr: float,
     epoch_time: float,
 ) -> str:
-    """将一个 epoch 的训练指标格式化为一行日志字符串。
-
-    示例输出:
-      [Epoch 010/500] loss=3.2456 lr=2.80e-04 time=1.2s
-
-    参数:
-      epoch        — 当前 epoch 编号（从 1 开始计数）
-      total_epochs — 训练总轮数
-      loss         — 本轮的平均损失值
-      lr           — 本轮使用的学习率
-      epoch_time   — 本轮耗时（秒）
-
-    返回:
-      格式化后的日志字符串
-    """
     return (
         f"[Epoch {epoch:03d}/{total_epochs}] "
         f"loss={loss:.4f} lr={lr:.2e} time={epoch_time:.1f}s"
     )
 
 
+# 训练结束摘要格式化
+# 示例输出:
+#   ============================================================
+#     训练完成
+#   ============================================================
+#     最终 loss:      0.0823
+#     最佳 loss:      0.0756 (epoch 487)
+#     总训练时间:     142.3s (2.4min)
+#     最佳模型路径:   checkpoints/best_model.pt
+#   ============================================================
 def format_train_summary(
     final_loss: float,
     best_loss: float,
@@ -161,28 +88,6 @@ def format_train_summary(
     total_time: float,
     best_model_path: str,
 ) -> str:
-    """将训练结束后的汇总信息格式化为多行字符串。
-
-    示例输出:
-      ============================================================
-        训练完成
-      ============================================================
-        最终 loss:      0.0823
-        最佳 loss:      0.0756 (epoch 487)
-        总训练时间:     142.3s (2.4min)
-        最佳模型路径:   checkpoints/best_model.pt
-      ============================================================
-
-    参数:
-      final_loss      — 最后一个 epoch 的平均 loss
-      best_loss       — 训练全程中的最低 loss
-      best_epoch      — best_loss 对应的 epoch 编号
-      total_time      — 训练总耗时（秒）
-      best_model_path — best_model.pt 的文件路径
-
-    返回:
-      格式化后的多行汇总字符串
-    """
     separator = "=" * 60
     return (
         f"\n{separator}\n"
@@ -196,65 +101,35 @@ def format_train_summary(
     )
 
 
+# 判断是否打印日志
 def should_log(epoch: int, start_epoch: int, log_interval: int = 10) -> bool:
-    """判断当前 epoch 是否需要打印训练日志。
-
-    打印规则:
-      1. (epoch + 1) 是 log_interval 的倍数 → 每隔 log_interval 轮打印一次
-      2. epoch == start_epoch              → 训练的第一轮一定打印
-
-    参数:
-      epoch        — 当前 epoch 编号（从 0 开始）
-      start_epoch  — 训练起始 epoch
-      log_interval — 打印间隔（默认 10）
-
-    返回:
-      True 表示本轮需要打印日志
-    """
     return (epoch + 1) % log_interval == 0 or epoch == start_epoch
 
 
 # ======================================================================
-# 主训练函数
-#
-# 预训练和微调共用同一个训练循环，区别只在于：
-#   - 使用的 Dataset 不同（PretrainDataset vs NovaDataset）
-#   - 由 setup_pretrain / setup_finetune 分别准备好 dataloader
-#   - train() 本身不关心数据从哪里来，只管迭代 dataloader 训练
+# 核心训练循环
 # ======================================================================
 def train(
     config: NovaConfig,
     dataloader: torch.utils.data.DataLoader,
     model: NovaModel,
+    # 优化器AdamW
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     start_epoch: int = 0,
     best_loss: float = float("inf"),
     checkpoint_dir: str = "checkpoints",
 ) -> dict:
-    """主训练函数：执行完整的训练循环。
-
-    预训练和微调阶段都使用此函数，只是传入的 dataloader 内容不同。
-
-    参数:
-      config         — NovaConfig，包含所有超参数
-      dataloader     — 训练数据的 DataLoader
-      model          — NovaModel 实例（已移到 device 上）
-      optimizer      — AdamW 优化器实例
-      device         — 训练设备（cpu / cuda / mps）
-      start_epoch    — 起始 epoch（断点续训时 > 0）
-      best_loss      — 当前最佳 loss（断点续训时从 checkpoint 加载）
-      checkpoint_dir — checkpoint 保存目录
-
-    返回:
-      dict: {"final_loss", "best_loss", "best_epoch", "total_time", "best_model_path"}
-    """
+    # 创建 checkpoints/ 目录（如果已存在就跳过），用来存训练过程中保存的.pt文件
     os.makedirs(checkpoint_dir, exist_ok=True)
+    # 记录训练开始的时间戳，训练结束后用来算总耗时
     train_start_time = time.time()
+    # 训练过程中如果某一轮的 loss 创了新低，就会更新这个值，最终打印在训练摘要里
     best_epoch = start_epoch
 
-    # AMP: 仅在 CUDA 上启用混合精度训练
+    # 前向传播中仅在 CUDA 上启用混合精度训练
     use_amp = device.type == "cuda"
+    # GradScaler 是混合精度训练的 梯度缩放器
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     amp_status = "ON (FP16)" if use_amp else "OFF (CPU/MPS 不支持)"
 
@@ -270,48 +145,104 @@ def train(
             f"没有可训练的轮次。请检查 config.epochs 设置或 checkpoint 的 epoch 值。"
         )
 
+    # 记录一轮（epoch）有多少个 batch
     total_batches = len(dataloader)
+    # 每隔多少个 batch 打印一次进度
     log_every_n_batches = max(1, min(50, total_batches // 20))
 
+    #  epoch 外层循环，遍历每一轮训练
     for epoch in range(start_epoch, config.epochs):
-        epoch_start_time = time.time()
+        epoch_start_time = time.time()  # 记录每一轮的训练开始时间
+        # 设置模型为训练模式
+        # pytorch有2种模式，分别是 训练模式 和 评估(推理)模式
+        # 不同的模式计算行为不同，比如Dropout在训练模式下会丢 向量维度 而评估模式不会
         model.train()
 
+        # 动态调整LR
+        # warmup_steps是学习率预热步数
+        # 整个学习率曲线分两个阶段:
+        #   学习率
+        #   ▲
+        #   │        ╭─────╮
+        #   │       ╱       ╲        余弦衰减阶段
+        #   │      ╱         ╲       （从 max_lr 平滑下降到 min_lr）
+        #   │     ╱           ╲
+        #   │    ╱             ╲
+        #   │   ╱               ╲
+        #   │  ╱                 ╲
+        #   │ ╱                   ╲──── min_lr
+        #   │╱                    │
+        #   ├─────┬───────────────┤──→ step
+        #   0   warmup          max_steps
+
+        # 1、预热阶段：epoch < warmup_steps，学习率从 0 线性增长到 max_lr
+        # 2、余弦衰减阶段：epoch >= warmup_steps，lr 从 max_lr 平滑下降到 min_lr
         lr = get_lr(epoch, config.warmup_steps, config.epochs, config.learning_rate)
+
+        # 把每一轮计算出来的LR更新进优化器
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
         total_loss = 0.0
+        # 按照batch size遍历DataLoader中的所有tensor进行训练
         for batch_idx, batch in enumerate(dataloader):
+            # 取出模型输入tensor和标签(正确答案)tensor
             input_ids = batch["input_ids"].to(device)
             target_ids = batch["target_ids"].to(device)
 
+            # CUDA时进行混合精度训练
             with torch.amp.autocast("cuda", enabled=use_amp):
+                # 回调模型的forward()函数
+                # Token Embedding -> Position Embedding -> Dropout -> TransformerBlock × n_layers 层 -> Final RMSNorm -> Output Linear
+                # 得到batch*seq_len个token的vocab_size预测分数
                 logits = model(input_ids)
-                loss = F.cross_entropy(
+
+                # loss值是模型的预测结果与实际结果经过交叉熵算出来的偏差分数,取平均得到一个标量loss
+                # 交叉熵函数的输入由logits和target_ids构成
+                loss = F.cross_entropy(  # 交叉熵计算函数
+                    # 把logits[batch, seq_len, vocab_size]拉平成[batch*seq_len, vocab_size]
                     logits.view(-1, config.vocab_size),
+                    # 把target_ids[batch, seq_len]拉平成[batch*seq_len]
                     target_ids.view(-1),
+                    # 损失函数遇到 -100 就跳过
                     ignore_index=-100,
                 )
 
+            # 清空上一个 batch 残留的梯度
             optimizer.zero_grad(set_to_none=True)
+            # 反向过程 cross_entropy → output 投影层 → final_norm → TransformerBlock × n_layers（每层里面反向走 FFN → RMSNorm → Attention → RMSNorm）→ Dropout → Embedding
+            # pytorch的自动微分引擎负责 反向传播沿着 Block 各子层按相反方向，基于复合函数求导和链式法则，逐层计算影响 loss 值的梯度值
             scaler.scale(loss).backward()
+            # 把之前放大的梯度缩回原始大小，只针对CUDA
             scaler.unscale_(optimizer)
+            # 如果所有参数的梯度的总范数超过 config.grad_clip（比如 1.0），就等比例缩小所有梯度，防止梯度爆炸
             torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=config.grad_clip
+                model.parameters(),
+                # 梯度裁剪阈值
+                max_norm=config.grad_clip,
             )
+            # 执行参数更新。优化器根据梯度和学习率，调整模型的所有权重参数。在 MPS/CPU 设备上等于直接 optimizer.step()
             scaler.step(optimizer)
+            # 更新 scaler 内部的缩放因子，为下一个 batch 做准备,这个也是仅针对CUDA设备
             scaler.update()
 
-            total_loss += loss.item()
+            total_loss += (
+                loss.item()
+            )  # 把这个 batch 的 loss 值累加起来，一轮结束后算平均 loss
 
+            # 计算训练进度日志，每隔多少个 batch 打印一次进度，打印当前进度、loss值、学习率、每秒处理的batch数、预计剩余时间
+            #   [Epoch 1/500] batch    50/200 ( 25.0%) | loss=3.2456 lr=3.00e-04 | 12.3 batch/s | ETA: 0h42m
             if (batch_idx + 1) % log_every_n_batches == 0 or batch_idx == 0:
                 elapsed = time.time() - epoch_start_time
                 batches_done = batch_idx + 1
                 speed = batches_done / elapsed
                 remaining_batches = total_batches - batches_done
                 remaining_epoch = remaining_batches / speed if speed > 0 else 0
-                remaining_epochs_after = (config.epochs - epoch - 1) * (total_batches / speed) if speed > 0 else 0
+                remaining_epochs_after = (
+                    (config.epochs - epoch - 1) * (total_batches / speed)
+                    if speed > 0
+                    else 0
+                )
                 eta_total = remaining_epoch + remaining_epochs_after
 
                 running_loss = total_loss / batches_done
@@ -386,80 +317,11 @@ def train(
 
 
 # ======================================================================
-# 断点续训 — checkpoint 加载
-# ======================================================================
-CHECKPOINT_REQUIRED_KEYS = {
-    "epoch",
-    "model_state_dict",
-    "optimizer_state_dict",
-    "loss",
-    "config",
-}
-
-
-def load_checkpoint(
-    path: str,
-    model: NovaModel,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-) -> tuple[int, float]:
-    """从 checkpoint 文件恢复模型和优化器的完整状态。
-
-    参数:
-      path      — checkpoint 文件路径
-      model     — NovaModel 实例（参数会被覆盖）
-      optimizer — 优化器实例（状态会被覆盖）
-      device    — 目标设备
-
-    返回:
-      (start_epoch, best_loss) 元组
-
-    异常:
-      FileNotFoundError — checkpoint 文件不存在
-      KeyError          — checkpoint 缺少必要字段
-    """
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"checkpoint 文件不存在: {path}")
-
-    print(f"\n加载 checkpoint: {path}")
-
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-
-    missing_keys = CHECKPOINT_REQUIRED_KEYS - set(checkpoint.keys())
-    if missing_keys:
-        raise KeyError(
-            f"checkpoint 缺少必要字段: {missing_keys}。"
-            f"已有字段: {set(checkpoint.keys())}"
-        )
-
-    model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-    start_epoch = checkpoint["epoch"]
-    best_loss = checkpoint["loss"]
-
-    print(f"  → 从 epoch {start_epoch} 继续训练，loss={best_loss:.4f}")
-
-    return start_epoch, best_loss
-
-
-# ======================================================================
-# 初始化函数：setup_pretrain —— 预训练阶段初始化
-#
-# 完整调用链:
-#   main()
-#     → setup_pretrain(data_path, resume_path)
-#       → ① load_pretrain_data()    加载 JSONL 纯文本
-#       → ② NovaTokenizer.train_from_texts()  训练 BPE 分词器
-#       → ③ PretrainDataset()       构建预训练数据集
-#       → ④ NovaModel()             创建模型
-#       → ⑤ AdamW()                 创建优化器
-#       → ⑥ load_checkpoint()       (可选) 断点续训
-#     → train()                     执行训练循环
+# 预训练阶段初始化
+# 加载语料数据 → 训练 BPE → 构建数据集 → 创建模型 → 创建 AdamW 优化器
 # ======================================================================
 def setup_pretrain(
     data_path: str = "data/pretrain",
-    resume_path: str | None = None,
 ) -> tuple[
     NovaConfig,
     torch.utils.data.DataLoader,
@@ -469,111 +331,95 @@ def setup_pretrain(
     int,
     float,
 ]:
-    """预训练阶段初始化：加载纯文本数据 → 训练 BPE → 构建数据集 → 创建模型。
-
-    与 setup_finetune 的区别:
-      - 使用 load_pretrain_data() 而非 load_qa_pairs()
-      - 在预训练数据上训练 BPE 分词器（微调直接加载已有的）
-      - 使用 PretrainDataset 而非 NovaDataset
-      - 模型默认随机初始化（可通过 --resume 断点续训）
-
-    参数:
-      data_path   — 预训练数据路径（目录或单个 .jsonl 文件）
-      resume_path — 断点续训的 checkpoint 路径（可选）
-
-    返回:
-      (config, dataloader, model, optimizer, device, start_epoch, best_loss)
-    """
-    # ── ① 加载预训练数据 ──
+    # 加载预训练语料包
     print(f"[1/5] 加载预训练数据: {data_path}")
+    # 调用dataset.py的load_pretrain_data函数 加载/解析预训练语料包
     texts = load_pretrain_data(data_path)
     print(f"       共 {len(texts)} 条文本")
 
+    # 限制预训练token总量（默认 50M），按 ~500 tokens/条估算采样数
     PRETRAIN_TOKEN_BUDGET = 50_000_000
     AVG_TOKENS_PER_TEXT = 500
     max_texts = PRETRAIN_TOKEN_BUDGET // AVG_TOKENS_PER_TEXT
     if len(texts) > max_texts:
-        print(f"       token 预算 {PRETRAIN_TOKEN_BUDGET // 1_000_000}M → 采样 {max_texts} 条（从 {len(texts)} 条中）")
+        print(
+            f"       token 预算 {PRETRAIN_TOKEN_BUDGET // 1_000_000}M → 采样 {max_texts} 条（从 {len(texts)} 条中）"
+        )
         texts = random.sample(texts, max_texts)
 
-    # ── ② 训练 BPE 分词器（已有则跳过） ──
+    # 训练BPE分词器，如果已有则直接加载
     tokenizer = NovaTokenizer()
     tokenizer_path = "data/tokenizer.json"
     if os.path.isfile(tokenizer_path):
         print(f"[2/5] 检测到已有分词器，直接加载: {tokenizer_path}")
-        tokenizer.load(tokenizer_path)
-        print(f"       词表大小: {tokenizer.vocab_size}（跳过 BPE 训练）")
+        tokenizer.load(tokenizer_path)  # 加载已经训练好的BPE分词器
+        print(f"       词表大小: {tokenizer.vocab_size}")
     else:
+        # 文本超过 20 万条 → 随机采样 20 万条来训练 BPE分词
+        # 文本不超过 20 万条 → 全部拿来训练BPE分词
         BPE_SAMPLE_SIZE = 200_000
         bpe_sample = min(len(texts), BPE_SAMPLE_SIZE)
         if len(texts) > BPE_SAMPLE_SIZE:
-            print(f"[2/5] 训练 BPE 分词器（从 {len(texts)} 条中采样 {bpe_sample} 条）...")
+            print(
+                f"[2/5] 训练 BPE 分词器（从 {len(texts)} 条中采样 {bpe_sample} 条）..."
+            )
             bpe_texts = random.sample(texts, BPE_SAMPLE_SIZE)
         else:
             print("[2/5] 训练 BPE 分词器...")
             bpe_texts = texts
+        # 执行BPE分词训练
         tokenizer.train_from_texts(bpe_texts)
+        # 保存训练好的BPE分词器
         tokenizer.save(tokenizer_path)
         print(f"       词表大小: {tokenizer.vocab_size}，已保存到 {tokenizer_path}")
 
-    # ── ③ 创建数据集和 DataLoader ──
+    # 创建数据集和 DataLoader
     print("[3/5] 创建预训练数据集和 DataLoader...")
     config = NovaConfig(vocab_size=tokenizer.vocab_size)
     config.max_seq_len = config.pretrain_max_seq_len
     config.batch_size = config.pretrain_batch_size
     config.learning_rate = config.pretrain_lr
+
+    # 预训练阶段将语料批量预编码、截断、填充、生成模型tensor输入和标签tensor输入
     dataset = PretrainDataset(texts, tokenizer, config.max_seq_len)
     del texts
+    # 创建DataLoader(数据加载迭代器)
+    # 编码结束后将Dataset包装好训练时取出Tensor进行训练
     dataloader = create_dataloader(dataset, batch_size=config.batch_size)
     print(f"       数据集大小: {len(dataset)} 条")
     print(f"       每轮 batch 数: {len(dataloader)} (batch_size={config.batch_size})")
 
-    # ── ④ 创建模型 ──
+    # 选择计算设备
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        print("======基于MPS训练...")
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
 
     print(f"[4/5] 创建模型 (device={device})...")
-    model = NovaModel(config).to(device)
-    model.print_parameter_summary()
 
-    # ── ⑤ 创建优化器 ──
+    # 初始化Decoder-Only Transformer 模型，并初始化模型的各个参数
+    model = NovaModel(config).to(device)
+    model.print_parameter_summary()  # 输出模型的参数统计
+
+    # 创建AdamW优化器
     print("[5/5] 创建 AdamW 优化器...")
     optimizer = torch.optim.AdamW(
         model.parameters(),
+        # LR学习率
         lr=config.learning_rate,
+        # 重衰减系数
         weight_decay=config.weight_decay,
     )
     print(f"       lr={config.learning_rate}, weight_decay={config.weight_decay}")
 
-    # ── ⑥ （可选）断点续训 ──
-    start_epoch = 0
-    best_loss = float("inf")
-    if resume_path is not None:
-        start_epoch, best_loss = load_checkpoint(
-            path=resume_path, model=model, optimizer=optimizer, device=device,
-        )
-
-    return config, dataloader, model, optimizer, device, start_epoch, best_loss
+    return config, dataloader, model, optimizer, device, 0, float("inf")
 
 
 # ======================================================================
-# 初始化函数：setup_finetune —— 微调阶段初始化
-#
-# 完整调用链:
-#   main()
-#     → setup_finetune(data_path, tokenizer_path, resume_path)
-#       → ① load_qa_pairs()          加载 QA 问答对
-#       → ② NovaTokenizer.load()     加载预训练阶段保存的 BPE 分词器
-#       → ③ NovaDataset()            构建微调数据集
-#       → ④ NovaModel()              创建模型
-#       → ⑤ AdamW()                  创建优化器
-#       → ⑥ load_checkpoint()        加载预训练 checkpoint 权重
-#     → train()                      执行微调训练循环
+# SFT初始化动作
+# 加载语料数据 → 加载BPE分词器 → 构建数据集 → 模型初始化 → 创建 AdamW 优化器 → 加载预训练权重
 # ======================================================================
 def setup_finetune(
     data_path: str = "data/sft/",
@@ -588,24 +434,9 @@ def setup_finetune(
     int,
     float,
 ]:
-    """微调阶段初始化：加载 QA 数据 → 加载 BPE 分词器 → 构建数据集 → 加载预训练权重。
-
-    与 setup_pretrain 的区别:
-      - 使用 load_qa_pairs() 加载 QA 数据
-      - 直接加载已有的 BPE 分词器（预训练阶段生成的 tokenizer.json）
-      - 使用 NovaDataset 而非 PretrainDataset
-      - 通过 --resume 加载预训练 checkpoint 权重作为起点
-
-    参数:
-      data_path      — QA 数据 JSONL 文件或目录路径
-      tokenizer_path — BPE 分词器文件路径（预训练阶段保存的）
-      resume_path    — 预训练 checkpoint 路径（用于加载预训练权重）
-
-    返回:
-      (config, dataloader, model, optimizer, device, start_epoch, best_loss)
-    """
-    # ── ① 加载微调数据 ──
+    # 加载微调数据 ──
     print(f"[1/5] 加载微调数据: {data_path}")
+    # 调用dataset.py的load_qa_pairs函数 加载/解析微调语料包
     qa_pairs = load_qa_pairs(data_path)
     print(f"       共 {len(qa_pairs)} 条问答对")
 
@@ -614,40 +445,46 @@ def setup_finetune(
     AVG_TOKENS_PER_QA = 500
     max_pairs = SFT_TOKEN_BUDGET // AVG_TOKENS_PER_QA
     if len(qa_pairs) > max_pairs:
-        print(f"       token 预算 {SFT_TOKEN_BUDGET // 1_000_000}M → 采样 {max_pairs} 条（从 {len(qa_pairs)} 条中）")
+        print(
+            f"       token 预算 {SFT_TOKEN_BUDGET // 1_000_000}M → 采样 {max_pairs} 条（从 {len(qa_pairs)} 条中）"
+        )
         qa_pairs = random.sample(qa_pairs, max_pairs)
 
-    # ── ② 加载已有 BPE 分词器 ──
+    # 加载BPE分词器
     print(f"[2/5] 加载 BPE 分词器: {tokenizer_path}")
+    # 初始化分词器
     tokenizer = NovaTokenizer()
+    # 加载BPE分词器
     tokenizer.load(tokenizer_path)
     print(f"       词表大小: {tokenizer.vocab_size}")
 
-    # ── ③ 创建数据集和 DataLoader ──
     print("[3/5] 创建微调数据集和 DataLoader...")
     config = NovaConfig(vocab_size=tokenizer.vocab_size)
     config.max_seq_len = config.finetune_max_seq_len
     config.batch_size = config.finetune_batch_size
     config.learning_rate = config.finetune_lr
+    # 微调阶段将问答对批量预编码、截断、填充、生成模型tensor输入和标签tensor输入
     dataset = NovaDataset(qa_pairs, tokenizer, config.max_seq_len)
+    # 把Dataset包装成可以按batch取数据的迭代器
     dataloader = create_dataloader(dataset, batch_size=config.batch_size)
     print(f"       数据集大小: {len(dataset)} 条")
     print(f"       每轮 batch 数: {len(dataloader)} (batch_size={config.batch_size})")
 
-    # ── ④ 创建模型 ──
+    # 指定计算设备
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        print("======基于MPS训练...")
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
 
     print(f"[4/5] 创建模型 (device={device})...")
+    # 初始化模型，并完成相关参数的初始化动作
     model = NovaModel(config).to(device)
+    # 输出模型参数
     model.print_parameter_summary()
 
-    # ── ⑤ 创建优化器 ──
+    # 创建AdamW 优化器
     print("[5/5] 创建 AdamW 优化器...")
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -656,13 +493,8 @@ def setup_finetune(
     )
     print(f"       lr={config.learning_rate}, weight_decay={config.weight_decay}")
 
-    # ── ⑥ 加载预训练 checkpoint ──
-    #
-    # 微调加载预训练权重时，只要模型参数（语言知识），不要 start_epoch。
-    # 因为微调是一个全新的训练阶段，应该从 epoch 0 开始，
-    # 而不是从预训练的 epoch 500 继续（那样 range(500, 1) 就是空循环）。
-    #
-    # 优化器状态也重置（预训练的动量/学习率对微调数据不适用）。
+    # 加载预训练权重
+    # 由于模型在预训练阶段已经学习过语言规律了，因此SFT微调继承了预训练的权重参数，在预训练的基础上继续进行更深层次的SFT训练
     start_epoch = 0
     best_loss = float("inf")
     if resume_path is not None:
@@ -691,170 +523,69 @@ def setup_finetune(
 
 
 # ======================================================================
-# 向后兼容：保留旧版 setup() 函数
-#
-# 旧代码（测试中）直接调用 setup()，等价于微调模式但会重新训练 BPE。
-# 保留此函数避免破坏已有测试。
-# ======================================================================
-def setup(
-    resume_path: str | None = None,
-) -> tuple[
-    NovaConfig,
-    torch.utils.data.DataLoader,
-    NovaModel,
-    torch.optim.Optimizer,
-    torch.device,
-    int,
-    float,
-]:
-    """向后兼容的初始化函数（等价于用 QA 数据从头训练）。
-
-    行为与旧版完全一致:
-      1. 加载 QA JSONL 数据
-      2. 在 QA 数据上训练 BPE 分词器
-      3. 创建 NovaDataset
-      4. 创建模型和优化器
-      5. (可选) 加载 checkpoint
-
-    此函数主要供已有测试使用，新代码请使用 setup_pretrain / setup_finetune。
-    """
-    # ── ① 加载训练数据 ──
-    data_path = "data/sft/"
-    print(f"[1/5] 加载训练数据: {data_path}")
-    qa_pairs = load_qa_pairs(data_path)
-    print(f"       共 {len(qa_pairs)} 条问答对")
-
-    # ── ② 构建 BPE 分词器 ──
-    print("[2/5] 构建 BPE 分词器...")
-    tokenizer = NovaTokenizer()
-    all_texts = []
-    for pair in qa_pairs:
-        all_texts.append(pair["question"])
-        all_texts.append(pair["answer"])
-    tokenizer.train_from_texts(all_texts)
-    tokenizer.save("data/tokenizer.json")
-    print(f"       词表大小: {tokenizer.vocab_size}，已保存到 data/tokenizer.json")
-
-    # ── ③ 创建数据集和 DataLoader ──
-    print("[3/5] 创建数据集和 DataLoader...")
-    config = NovaConfig(vocab_size=tokenizer.vocab_size)
-    config.max_seq_len = config.finetune_max_seq_len
-    config.batch_size = config.finetune_batch_size
-    config.learning_rate = config.finetune_lr
-    dataset = NovaDataset(qa_pairs, tokenizer, config.max_seq_len)
-    dataloader = create_dataloader(dataset, batch_size=config.batch_size)
-    print(f"       数据集大小: {len(dataset)} 条")
-    print(f"       每轮 batch 数: {len(dataloader)} (batch_size={config.batch_size})")
-
-    # ── ④ 创建模型 ──
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        print("======基于MPS训练...")
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-
-    print(f"[4/5] 创建模型 (device={device})...")
-    model = NovaModel(config).to(device)
-    model.print_parameter_summary()
-
-    # ── ⑤ 创建优化器 ──
-    print("[5/5] 创建 AdamW 优化器...")
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
-    print(f"       lr={config.learning_rate}, weight_decay={config.weight_decay}")
-
-    # ── ⑥ （可选）断点续训 ──
-    start_epoch = 0
-    best_loss = float("inf")
-    if resume_path is not None:
-        start_epoch, best_loss = load_checkpoint(
-            path=resume_path, model=model, optimizer=optimizer, device=device,
-        )
-
-    return config, dataloader, model, optimizer, device, start_epoch, best_loss
-
-
-# ======================================================================
-# 命令行入口
-#
-# 用法:
-#   # 预训练（从纯文本学语言，默认 3 轮）
-#   .venv/bin/python train.py --mode pretrain
-#   .venv/bin/python train.py --mode pretrain --data data/pretrain/
-#   .venv/bin/python train.py --mode pretrain --epochs 5
-#
-#   # 微调（从 QA 学对话，加载预训练权重，默认 500 轮）
-#   .venv/bin/python train.py --mode finetune --resume checkpoints/best_model.pt
-#   .venv/bin/python train.py --mode finetune --data data/sft/ --epochs 300
-#
-#   # 向后兼容（等价于旧版行为：用 QA 数据从头训练，默认 500 轮）
-#   .venv/bin/python train.py
-#   .venv/bin/python train.py --resume checkpoints/epoch_50.pt
+# 主函数
 # ======================================================================
 def main() -> None:
-    """命令行入口：支持预训练 / 微调 / 向后兼容三种模式。"""
+    # 如果支持cuda的情况下，允许矩阵乘法用 TF32（TensorFloat-32）精度代替完整的 FP32，速度快很多，精度损失极小
     if torch.cuda.is_available():
+        # highest最高精度、high高精度、medium激进且速度优先
+        # AMP把能降的降到 FP16，降不了的留 FP32，而留下的那些 FP32 矩阵乘法又被 TF32 进一步加速
         torch.set_float32_matmul_precision("medium")
+        # cuDNN 是 NVIDIA 提供的深度学习底层加速库，里面同一种运算（比如矩阵乘法）有不同的算法实现
+        # benchmark = True会在训练过程中自动选择最优算法，提高训练速度
         torch.backends.cudnn.benchmark = True
 
     parser = argparse.ArgumentParser(description="Nova 模型训练")
+    # 指定训练模式，pretrain是预训练，finetune是微调
     parser.add_argument(
         "--mode",
         type=str,
         choices=["pretrain", "finetune"],
-        default=None,
-        help="训练模式: pretrain=预训练, finetune=微调（不指定则使用旧版兼容模式）",
+        required=True,
+        help="训练模式: pretrain=预训练, finetune=微调",
     )
+    # 微调时加载预训练权重
     parser.add_argument(
         "--resume",
         type=str,
         default=None,
-        help="checkpoint 路径，用于断点续训或加载预训练权重",
+        help="checkpoint 路径，用于微调时加载预训练权重",
     )
+    # 指定训练时的语料包文件或路径
     parser.add_argument(
         "--data",
         type=str,
         default=None,
         help="数据路径（预训练: JSONL 目录/文件，微调: JSON 文件）",
     )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=None,
-        help="训练轮数（预训练默认 3，微调默认 500，向后兼容默认 500）",
-    )
     args = parser.parse_args()
 
+    # 根据不同的模式执行不同的训练初始化动作
     if args.mode == "pretrain":
-        # ── 预训练模式 ──
         data_path = args.data or "data/pretrain"
         config, dataloader, model, optimizer, device, start_epoch, best_loss = (
-            setup_pretrain(data_path=data_path, resume_path=args.resume)
+            # 预训练初始化
+            setup_pretrain(data_path=data_path)
         )
-        config.epochs = args.epochs or config.pretrain_epochs
+        # 根据训练模式的不同，覆盖config中的相关超参
+        config.epochs = config.pretrain_epochs
+        # 计算预热步数,预训练阶段LR需要进入到预热阶段，因为预训练阶段参数是随机的，需要逐步升温
         config.warmup_steps = min(config.warmup_steps, config.epochs // 2)
-    elif args.mode == "finetune":
-        # ── 微调模式 ──
+    else:
         data_path = args.data or "data/sft/"
         config, dataloader, model, optimizer, device, start_epoch, best_loss = (
+            # 微调训练初始化
             setup_finetune(data_path=data_path, resume_path=args.resume)
         )
-        config.epochs = args.epochs or config.finetune_epochs
+        config.epochs = config.finetune_epochs
+        # SFT阶段LR不需要再进入到预热阶段，而是直接进入到余弦衰减阶段，因为SFT阶段可以在预训练后的权重基础上训练，参数不再随机所以不需要逐步升温
         config.warmup_steps = 0
-    else:
-        # ── 向后兼容模式（不指定 --mode） ──
-        config, dataloader, model, optimizer, device, start_epoch, best_loss = (
-            setup(resume_path=args.resume)
-        )
-        config.epochs = args.epochs or config.finetune_epochs
 
     print(f"\n训练轮数: {config.epochs}，warmup: {config.warmup_steps}")
-    print(f"batch_size: {config.batch_size}，max_seq_len: {config.max_seq_len}，lr: {config.learning_rate}")
+    print(
+        f"batch_size: {config.batch_size}，max_seq_len: {config.max_seq_len}，lr: {config.learning_rate}"
+    )
+    # 执行核心训练循环
     train(
         config=config,
         dataloader=dataloader,
@@ -864,7 +595,6 @@ def main() -> None:
         start_epoch=start_epoch,
         best_loss=best_loss,
     )
-
 
 
 if __name__ == "__main__":

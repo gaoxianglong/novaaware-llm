@@ -2,16 +2,14 @@
 
 测试范围:
   1. get_lr              — 学习率调度器的数学正确性（Warmup + Cosine Decay）
-  2. setup               — 初始化流程的组件构建（模型、优化器、数据集）
-  3. setup_pretrain      — 预训练阶段初始化
-  4. setup_finetune      — 微调阶段初始化
-  5. train               — 训练循环的基本功能（loss 下降、checkpoint 保存）
-  6. format_train_log    — 训练日志格式化
-  7. should_log          — 日志打印条件判断
-  8. load_checkpoint     — 断点续训 checkpoint 加载、验证、恢复
-  9. format_train_summary— 训练结束后汇总格式化
-  10. 验收标准           — 端到端功能验收（loss 下降、checkpoint 可加载、续训、过拟合）
-  11. 预训练验收         — 预训练阶段端到端功能验收
+  2. setup_pretrain      — 预训练阶段初始化
+  3. setup_finetune      — 微调阶段初始化
+  4. train               — 训练循环的基本功能（loss 下降、checkpoint 保存）
+  5. format_train_log    — 训练日志格式化
+  6. should_log          — 日志打印条件判断
+  7. format_train_summary— 训练结束后汇总格式化
+  8. 验收标准           — 端到端功能验收（loss 下降、checkpoint 保存、过拟合）
+  9. 预训练验收         — 预训练阶段端到端功能验收
 
 运行方式:
   .venv/bin/pytest tests/test_train.py -v
@@ -33,10 +31,9 @@ from tokenizer import NovaTokenizer
 from dataset import NovaDataset, PretrainDataset, create_dataloader
 from model import NovaModel
 from train import (
-    get_lr, train, setup, setup_pretrain, setup_finetune,
+    get_lr, train, setup_pretrain, setup_finetune,
     format_train_log, should_log,
     format_train_summary,
-    load_checkpoint, CHECKPOINT_REQUIRED_KEYS,
 )
 
 
@@ -150,60 +147,6 @@ class TestGetLR(unittest.TestCase):
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         expected = 1e-5 + coeff * (1e-3 - 1e-5)
         self.assertAlmostEqual(lr, expected, places=10)
-
-
-# ======================================================================
-# TestSetup — 初始化流程测试
-# ======================================================================
-class TestSetup(unittest.TestCase):
-    """验证 setup 函数正确构建所有训练组件。"""
-
-    @classmethod
-    def setUpClass(cls):
-        """只执行一次 setup（比较耗时），结果供所有测试复用。"""
-        cls.config, cls.dataloader, cls.model, cls.optimizer, \
-            cls.device, cls.start_epoch, cls.best_loss = setup()
-
-    def test_config_vocab_size_set(self):
-        """config.vocab_size 应由分词器动态设置，大于 0。"""
-        self.assertGreater(self.config.vocab_size, 0)
-
-    def test_dataloader_not_empty(self):
-        """DataLoader 应至少有 1 个 batch。"""
-        self.assertGreater(len(self.dataloader), 0)
-
-    def test_dataloader_batch_shape(self):
-        """DataLoader 的第一个 batch 形状应为 [batch_size, max_seq_len]。"""
-        batch = next(iter(self.dataloader))
-        self.assertEqual(batch["input_ids"].dim(), 2)
-        self.assertEqual(batch["input_ids"].shape[1], self.config.max_seq_len)
-        self.assertEqual(batch["target_ids"].shape[1], self.config.max_seq_len)
-
-    def test_model_is_nova_model(self):
-        """创建的模型应该是 NovaModel 实例。"""
-        self.assertIsInstance(self.model, NovaModel)
-
-    def test_model_on_correct_device(self):
-        """模型参数应在正确的设备上。"""
-        param = next(self.model.parameters())
-        self.assertEqual(param.device.type, self.device.type)
-
-    def test_optimizer_is_adamw(self):
-        """优化器应该是 AdamW。"""
-        self.assertIsInstance(self.optimizer, torch.optim.AdamW)
-
-    def test_optimizer_lr(self):
-        """优化器的初始学习率应等于 config.learning_rate。"""
-        for pg in self.optimizer.param_groups:
-            self.assertEqual(pg["lr"], self.config.learning_rate)
-
-    def test_start_epoch_zero(self):
-        """不加载 checkpoint 时，start_epoch 应为 0。"""
-        self.assertEqual(self.start_epoch, 0)
-
-    def test_best_loss_inf(self):
-        """不加载 checkpoint 时，best_loss 应为正无穷。"""
-        self.assertEqual(self.best_loss, float("inf"))
 
 
 # ======================================================================
@@ -332,53 +275,6 @@ class TestTrain(unittest.TestCase):
             self.assertIn("loss", ckpt)
             self.assertIn("config", ckpt)
             self.assertEqual(ckpt["epoch"], 50)
-        finally:
-            shutil.rmtree(tmp_dir)
-
-    def test_resume_training(self):
-        """断点续训：加载 checkpoint 后应能继续训练且 loss 继续下降。"""
-        config, dataloader, model, optimizer, device = self._make_mini_training_env(
-            epochs=50,
-        )
-        tmp_dir = tempfile.mkdtemp()
-        try:
-            # 第一阶段：训练 50 轮
-            train(config, dataloader, model, optimizer, device,
-                  checkpoint_dir=tmp_dir)
-
-            # 加载 checkpoint
-            ckpt_path = os.path.join(tmp_dir, "best_model.pt")
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            loss_before_resume = ckpt["loss"]
-
-            # 重建模型和优化器，加载状态
-            model2 = NovaModel(config).to(device)
-            model2.load_state_dict(ckpt["model_state_dict"])
-            optimizer2 = torch.optim.AdamW(
-                model2.parameters(),
-                lr=config.learning_rate,
-                weight_decay=config.weight_decay,
-            )
-            optimizer2.load_state_dict(ckpt["optimizer_state_dict"])
-
-            # 第二阶段：继续训练
-            config2 = NovaConfig(
-                vocab_size=config.vocab_size,
-                d_model=32, n_heads=2, n_layers=1, d_ff=64,
-                max_seq_len=32, batch_size=2,
-                epochs=100, learning_rate=1e-3, warmup_steps=2, dropout=0.0,
-            )
-            train(config2, dataloader, model2, optimizer2, device,
-                  start_epoch=ckpt["epoch"], best_loss=ckpt["loss"],
-                  checkpoint_dir=tmp_dir)
-
-            # 续训后的最佳模型 loss 应 <= 续训前的 loss
-            ckpt2 = torch.load(
-                os.path.join(tmp_dir, "best_model.pt"),
-                map_location="cpu",
-                weights_only=False,
-            )
-            self.assertLessEqual(ckpt2["loss"], loss_before_resume)
         finally:
             shutil.rmtree(tmp_dir)
 
@@ -536,205 +432,6 @@ class TestShouldLog(unittest.TestCase):
         """即使 start_epoch 不在 interval 上，也照样打印。"""
         self.assertTrue(should_log(epoch=37, start_epoch=37))
         self.assertFalse(should_log(epoch=38, start_epoch=37))
-
-
-# ======================================================================
-# TestLoadCheckpoint — 断点续训 checkpoint 加载测试
-# ======================================================================
-class TestLoadCheckpoint(unittest.TestCase):
-    """验证 load_checkpoint 函数的加载、验证、恢复逻辑。
-
-    测试策略:
-      - 先用 train() 训练几轮生成真实的 checkpoint 文件
-      - 再用 load_checkpoint() 加载，验证模型/优化器状态是否正确恢复
-      - 同时测试各种错误场景（文件不存在、字段缺失）
-    """
-
-    def _make_mini_env(self, epochs=10):
-        """构建极小训练环境，与 TestTrain 共用同一套 helper。"""
-        tokenizer = NovaTokenizer()
-        texts = ["你好", "世界", "你叫什么名字", "我是Nova"]
-        tokenizer.train_from_texts(texts)
-        config = NovaConfig(
-            vocab_size=tokenizer.vocab_size,
-            d_model=32, n_heads=2, n_layers=1, d_ff=64,
-            max_seq_len=32, batch_size=2, epochs=epochs,
-            learning_rate=1e-3, warmup_steps=2, dropout=0.0,
-        )
-        qa_pairs = [
-            {"question": "你好", "answer": "世界"},
-            {"question": "你叫什么名字", "answer": "我是Nova"},
-        ]
-        dataset = NovaDataset(qa_pairs, tokenizer, config.max_seq_len)
-        dataloader = create_dataloader(dataset, batch_size=config.batch_size)
-        device = torch.device("cpu")
-        model = NovaModel(config).to(device)
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=config.learning_rate,
-            weight_decay=config.weight_decay,
-        )
-        return config, dataloader, model, optimizer, device
-
-    def _train_and_save(self, epochs=20):
-        """训练几轮并返回 (config, checkpoint_dir, device)，供后续测试使用。"""
-        config, dataloader, model, optimizer, device = self._make_mini_env(epochs=epochs)
-        tmp_dir = tempfile.mkdtemp()
-        train(config, dataloader, model, optimizer, device, checkpoint_dir=tmp_dir)
-        return config, tmp_dir, device
-
-    # ── 正常加载 ──
-
-    def test_load_returns_correct_start_epoch(self):
-        """加载 checkpoint 后返回的 start_epoch 应等于保存时的 epoch。"""
-        config, tmp_dir, device = self._train_and_save(epochs=50)
-        try:
-            ckpt_path = os.path.join(tmp_dir, "epoch_50.pt")
-            model = NovaModel(config).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-            start_epoch, _ = load_checkpoint(ckpt_path, model, optimizer, device)
-            self.assertEqual(start_epoch, 50)
-        finally:
-            shutil.rmtree(tmp_dir)
-
-    def test_load_returns_correct_best_loss(self):
-        """加载 checkpoint 后返回的 best_loss 应等于保存时的 loss。"""
-        config, tmp_dir, device = self._train_and_save(epochs=50)
-        try:
-            ckpt_path = os.path.join(tmp_dir, "epoch_50.pt")
-            saved_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            expected_loss = saved_ckpt["loss"]
-
-            model = NovaModel(config).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-            _, best_loss = load_checkpoint(ckpt_path, model, optimizer, device)
-            self.assertAlmostEqual(best_loss, expected_loss, places=6)
-        finally:
-            shutil.rmtree(tmp_dir)
-
-    def test_model_state_restored(self):
-        """加载后模型参数应与 checkpoint 中保存的完全一致。"""
-        config, tmp_dir, device = self._train_and_save(epochs=50)
-        try:
-            ckpt_path = os.path.join(tmp_dir, "best_model.pt")
-            saved_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-
-            model = NovaModel(config).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-            load_checkpoint(ckpt_path, model, optimizer, device)
-
-            for name, param in model.named_parameters():
-                saved_param = saved_ckpt["model_state_dict"][name]
-                self.assertTrue(
-                    torch.equal(param.data.cpu(), saved_param.cpu()),
-                    f"参数 {name} 未正确恢复",
-                )
-        finally:
-            shutil.rmtree(tmp_dir)
-
-    def test_optimizer_state_restored(self):
-        """加载后优化器状态（动量 m/v）应与 checkpoint 中保存的一致。"""
-        config, tmp_dir, device = self._train_and_save(epochs=50)
-        try:
-            ckpt_path = os.path.join(tmp_dir, "best_model.pt")
-            saved_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-
-            model = NovaModel(config).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-            load_checkpoint(ckpt_path, model, optimizer, device)
-
-            restored_state = optimizer.state_dict()
-            saved_state = saved_ckpt["optimizer_state_dict"]
-            self.assertEqual(
-                len(restored_state["param_groups"]),
-                len(saved_state["param_groups"]),
-            )
-            self.assertEqual(
-                len(restored_state["state"]),
-                len(saved_state["state"]),
-            )
-        finally:
-            shutil.rmtree(tmp_dir)
-
-    def test_load_best_model(self):
-        """加载 best_model.pt 也能正常工作。"""
-        config, tmp_dir, device = self._train_and_save(epochs=20)
-        try:
-            best_path = os.path.join(tmp_dir, "best_model.pt")
-            self.assertTrue(os.path.exists(best_path))
-
-            model = NovaModel(config).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-            start_epoch, best_loss = load_checkpoint(best_path, model, optimizer, device)
-            self.assertGreater(start_epoch, 0)
-            self.assertGreater(best_loss, 0.0)
-            self.assertFalse(math.isinf(best_loss))
-        finally:
-            shutil.rmtree(tmp_dir)
-
-    # ── 错误处理 ──
-
-    def test_file_not_found_raises(self):
-        """checkpoint 文件不存在时应抛出 FileNotFoundError。"""
-        config, _, _, _, device = self._make_mini_env()
-        model = NovaModel(config).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-        with self.assertRaises(FileNotFoundError):
-            load_checkpoint("/nonexistent/path/ckpt.pt", model, optimizer, device)
-
-    def test_missing_keys_raises(self):
-        """checkpoint 缺少必要字段时应抛出 KeyError。"""
-        config, _, _, _, device = self._make_mini_env()
-        model = NovaModel(config).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-
-        tmp_dir = tempfile.mkdtemp()
-        try:
-            bad_ckpt_path = os.path.join(tmp_dir, "bad.pt")
-            torch.save({"epoch": 10}, bad_ckpt_path)
-            with self.assertRaises(KeyError):
-                load_checkpoint(bad_ckpt_path, model, optimizer, device)
-        finally:
-            shutil.rmtree(tmp_dir)
-
-    # ── 端到端续训 ──
-
-    def test_resume_then_train_loss_not_worse(self):
-        """加载 checkpoint 后继续训练，最终 loss 应 ≤ 加载时的 loss。"""
-        config, dataloader, model, optimizer, device = self._make_mini_env(epochs=50)
-        tmp_dir = tempfile.mkdtemp()
-        try:
-            train(config, dataloader, model, optimizer, device, checkpoint_dir=tmp_dir)
-
-            ckpt_path = os.path.join(tmp_dir, "best_model.pt")
-            model2 = NovaModel(config).to(device)
-            optimizer2 = torch.optim.AdamW(
-                model2.parameters(), lr=config.learning_rate,
-                weight_decay=config.weight_decay,
-            )
-            start_epoch, best_loss = load_checkpoint(ckpt_path, model2, optimizer2, device)
-
-            config2 = NovaConfig(
-                vocab_size=config.vocab_size,
-                d_model=32, n_heads=2, n_layers=1, d_ff=64,
-                max_seq_len=32, batch_size=2,
-                epochs=100, learning_rate=1e-3, warmup_steps=2, dropout=0.0,
-            )
-            train(config2, dataloader, model2, optimizer2, device,
-                  start_epoch=start_epoch, best_loss=best_loss,
-                  checkpoint_dir=tmp_dir)
-
-            final_ckpt = torch.load(
-                os.path.join(tmp_dir, "best_model.pt"),
-                map_location="cpu", weights_only=False,
-            )
-            self.assertLessEqual(final_ckpt["loss"], best_loss)
-        finally:
-            shutil.rmtree(tmp_dir)
-
-    def test_required_keys_constant(self):
-        """CHECKPOINT_REQUIRED_KEYS 应包含所有 5 个必要字段。"""
-        expected = {"epoch", "model_state_dict", "optimizer_state_dict", "loss", "config"}
-        self.assertEqual(CHECKPOINT_REQUIRED_KEYS, expected)
 
 
 # ======================================================================
@@ -1061,8 +758,8 @@ class TestAcceptanceCriteria(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir)
 
-    def test_acceptance_checkpoint_save_and_load(self):
-        """验收标准 2: checkpoint 文件正确保存且可加载。"""
+    def test_acceptance_checkpoint_save(self):
+        """验收标准 2: checkpoint 文件正确保存。"""
         config, dataloader, model, optimizer, device = self._make_mini_env(epochs=50)
         tmp_dir = tempfile.mkdtemp()
         try:
@@ -1074,44 +771,11 @@ class TestAcceptanceCriteria(unittest.TestCase):
             self.assertTrue(os.path.isfile(result["best_model_path"]),
                             "best_model.pt 应存在")
 
-            model2 = NovaModel(config).to(device)
-            optimizer2 = torch.optim.AdamW(model2.parameters(), lr=config.learning_rate)
-            start_epoch, best_loss = load_checkpoint(ckpt_path, model2, optimizer2, device)
-            self.assertEqual(start_epoch, 50, "加载后 start_epoch 应为 50")
-            self.assertFalse(math.isnan(best_loss), "加载后 best_loss 不应为 NaN")
-        finally:
-            shutil.rmtree(tmp_dir)
-
-    def test_acceptance_resume_continues_training(self):
-        """验收标准 3: 断点续训后 loss 能继续下降。"""
-        config, dataloader, model, optimizer, device = self._make_mini_env(epochs=50)
-        tmp_dir = tempfile.mkdtemp()
-        try:
-            result1 = train(config, dataloader, model, optimizer, device,
-                            checkpoint_dir=tmp_dir)
-            loss_after_phase1 = result1["best_loss"]
-
-            model2 = NovaModel(config).to(device)
-            optimizer2 = torch.optim.AdamW(
-                model2.parameters(), lr=config.learning_rate,
-                weight_decay=config.weight_decay,
-            )
-            start_epoch, best_loss = load_checkpoint(
-                result1["best_model_path"], model2, optimizer2, device,
-            )
-
-            config2 = NovaConfig(
-                vocab_size=config.vocab_size,
-                d_model=32, n_heads=2, n_layers=1, d_ff=64,
-                max_seq_len=32, batch_size=2,
-                epochs=100, learning_rate=1e-3, warmup_steps=2, dropout=0.0,
-            )
-            result2 = train(config2, dataloader, model2, optimizer2, device,
-                            start_epoch=start_epoch, best_loss=best_loss,
-                            checkpoint_dir=tmp_dir)
-
-            self.assertLessEqual(result2["best_loss"], loss_after_phase1,
-                                 "续训后 best_loss 应 ≤ 续训前")
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            self.assertIn("model_state_dict", ckpt)
+            self.assertIn("optimizer_state_dict", ckpt)
+            self.assertEqual(ckpt["epoch"], 50)
+            self.assertFalse(math.isnan(ckpt["loss"]))
         finally:
             shutil.rmtree(tmp_dir)
 
@@ -1290,14 +954,15 @@ class TestPretrainTrain(unittest.TestCase):
             ft_dataset = NovaDataset(qa_pairs, tokenizer, config.max_seq_len)
             ft_dataloader = create_dataloader(ft_dataset, batch_size=2)
 
-            # ── 加载预训练 checkpoint ──
+            # ── 加载预训练权重 ──
             model2 = NovaModel(config).to(device)
             optimizer2 = torch.optim.AdamW(
                 model2.parameters(), lr=config.learning_rate,
                 weight_decay=config.weight_decay,
             )
             ckpt_path = os.path.join(tmp_dir, "best_model.pt")
-            load_checkpoint(ckpt_path, model2, optimizer2, device)
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            model2.load_state_dict(ckpt["model_state_dict"])
 
             # ── 微调 ──
             ft_config = NovaConfig(

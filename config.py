@@ -111,7 +111,7 @@ class NovaConfig:
     batch_size: int = 8
 
     # 预训练轮数
-    pretrain_epochs: int = 1
+    pretrain_epochs: int = 3
     # 微调轮数
     finetune_epochs: int = 500
     epochs: int = 1
@@ -125,7 +125,7 @@ class NovaConfig:
     # 权重衰减系数,标准是0.01,优化器会让参数往0拉一点,防止过拟合
     weight_decay: float = 0.01
 
-    # 学习率预热步数,训练初期模型参数是随机的，梯度方向不可靠。前 100 步学习率从 0 线性增长到learning_rate，给模型一个"热身"阶段，避免一开始步子太大走偏
+    # 学习率预热步数,训练初期模型参数是随机的，梯度方向不可靠。前 100 步（epoch）学习率从 0 线性增长到learning_rate，给模型一个"热身"阶段，避免一开始步子太大走偏
     warmup_steps: int = 100
 
     # 梯度裁剪阈值,反向传播时，如果梯度的 L2 范数超过 1.0，就按比例缩小到 1.0。防止个别 batch产生异常大的梯度导致参数剧烈震荡（梯度爆炸）
