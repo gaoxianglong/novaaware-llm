@@ -69,10 +69,8 @@ class NovaTokenizer:
         tokenizer = Tokenizer(models.BPE(unk_token=UNK_TOKEN))
 
         # 2、配置预分词器
-        # 粗切，把一段语料文本切成若干段，后续进行token化
-        # 按 Unicode 脚本边界（不同语言交接的地方） + 数字 + 标点符号进行初步切分
-        # 这样中文字符、英文单词、数字、标点会被分到不同的组
-        # BPE 的高频合并严格限制在预分词切好的每一段内部进行，不会跨段合并
+        # 粗切，把一段语料文本切成若干段，后续进行token化，如果不做粗切直接在整段文本中找高频token对，会出现一些无意义的词组合并
+        # 按 Unicode 脚本边界（不同语言交接的地方） + 数字 + 标点符号进行初步切分，这样中文字符、英文单词、数字、标点会被分到不同的组
         tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
             [
                 # UnicodeScripts默认会按照书写系统进行Unicode字符切分，汉字、英文、数字、标点会被分到不同的组
@@ -80,6 +78,8 @@ class NovaTokenizer:
                 # UnicodeScripts 切分:
                 #   "我今天很" | "happy" | "，" | "你" | "happy" | "吗"
                 #    Han        Latin     Common  Han   Latin     Han
+                # BPE 的高频合并严格限制在预分词切好的每一段内部进行，不会跨段合并，避免一些无意义的合并
+                # 比如："我今天很" 内部：可以合并 "今"+"天" → "今天" ✓， "很"+"h" 跨段了 → 禁止 ✗
                 pre_tokenizers.UnicodeScripts(),
                 # 除了按脚本边界、数字、标点符号切分外，还要指定预分词器组合空格切分，这主要是给英文这种基于空格分词的语言使用的
                 # 如果使用空格分词的语言不加上空格切分，会出现一些跨单词的无意义的组合，比如love you，会组合成e y。
@@ -136,7 +136,7 @@ class NovaTokenizer:
             return []
         if self._tokenizer is None:
             raise RuntimeError("分词器未初始化，请先调用 train_from_texts() 或 load()")
-        # 将输入文本序列编码映射为一组tokenid
+        # 将输入文本序列编码映射为一组tokenids序列
         return self._tokenizer.encode(text).ids
 
     # ------------------------------------------------------------------
