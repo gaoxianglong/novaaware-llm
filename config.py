@@ -62,9 +62,9 @@ class NovaConfig:
     # Nova的架构超参
     # ========================
 
-    # RTX 4090 D (24GB) — 目标 ~22M 参数（宽而浅，GPU 友好）
+    # RTX 4090 (24GB) — ~22M 参数（不是4090的极限，只是单纯我不想训练那么久，训练阶段长时间占用显卡我没游戏玩儿）
     # d_model = 384, n_heads = 6, n_layers = 4, d_ff = 1536
-    # max_seq_len = 1024, batch_size = 256
+    # max_seq_len = 256, batch_size = 16，vocab_size=16000
     # 训练预算: 3 亿预训练 tokens + 1 亿 SFT tokens = 4 亿 (Chinchilla 最优)
 
     # Total = V × D + S × D + L × (2D + 4D² + 3D × F) + D + D × V
@@ -87,9 +87,9 @@ class NovaConfig:
     # FFN(前馈网络)中W1和W3通路的扩容维度,建议 d_ff = 4 × d_model
     d_ff: int = 1536
 
-    # 预训练的token上下文长度
+    # 预训练的token上下文长度，mac上我调为128
     pretrain_max_seq_len: int = 128
-    # 微调的token上下文长度
+    # 微调的token上下文长度，mac上我调为128
     finetune_max_seq_len: int = 128
     max_seq_len: int = 128
 
