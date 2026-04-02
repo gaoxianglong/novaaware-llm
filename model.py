@@ -150,7 +150,7 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = d_model // n_heads  # // python语法只保留整数结果
 
         # 声明 W_Q、W_K、W_V、W_O 四个投影矩阵
-        # bias=False被设置为无偏置，这其实是LLaMA的做法，因为偏置项对模型训练影响不大，去掉可以减少参数
+        # bias=False被设置为无偏置，这其实是LLaMA的做法，因为偏置项对模型训练影响不大，去掉可以减少训练参数
         self.w_q = nn.Linear(d_model, d_model, bias=False)
         self.w_k = nn.Linear(d_model, d_model, bias=False)
         self.w_v = nn.Linear(d_model, d_model, bias=False)
