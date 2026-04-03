@@ -74,7 +74,7 @@ def generate(
     # 单次回答最多生成多少个答案 token
     max_new_tokens = _DEFAULTS.max_new_tokens
 
-    # 把用户的输入问题编码为 token ids，然后收尾拼接上<s>和<sep>
+    # 把用户的输入问题编码为 token ids，然后首尾分别拼接上<s>和<sep>
     input_ids = [BOS_ID] + tokenizer.encode(question) + [SEP_ID]
     # 转为模型的输入tensor
     ids = torch.tensor([input_ids], dtype=torch.long, device=device)
