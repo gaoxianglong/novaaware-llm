@@ -1,0 +1,83 @@
+训练阶段显存占用计算
+那个文档里的计算全程用的是 FP32。
+
+所有的 × 4 bytes 都是按 FP32（32 bit = 4 bytes）算的，包括权重、梯度、优化器状态和激活值。
+
+如果你实际训练时开了 AMP（混合精度），激活值部分会用 FP16 存储（2 bytes 而不是 4 bytes），激活值大约减半，但固定开销（权重 + 梯度 + Adam 状态）不变，仍然是 FP32。
+
+TF32和FP32，存储都是一样的都是4bytes，只是在计算上TF32计算精度更低？
+对，完全正确。
+
+存储：TF32 和 FP32 在显存里占的空间完全一样，都是 4 bytes / 32 bit。数据格式没有任何变化。
+计算：GPU 的 Tensor Core 在做矩阵乘法时，内部偷偷把 FP32 的尾数从 23 位截断到 10 位来加速运算，算完结果仍然输出为 FP32。
+所以 TF32 不是一种存储格式，它是一种硬件计算策略。你的权重在显存里存的就是标准 FP32，只是 GPU 算乘法的那一瞬间精度低了一点、速度快了一点。对显存占用零影响。
+====================
+
+
+一、参数量公式
+--------------
+
+P = vocab_size × d_model
+  + max_seq_len × d_model
+  + n_layers × (2 × d_model + 4 × d_model² + 3 × d_model × d_ff)
+  + d_model
+  + d_model × vocab_size
+
+其中各项含义：
+  vocab_size × d_model           → Token Embedding
+  max_seq_len × d_model          → Position Embedding
+  n_layers × (                   → 每个 Transformer Block × 层数
+    2 × d_model                    → 2 个 RMSNorm 的 gamma
+    + 4 × d_model²                 → Attention 的 W_Q + W_K + W_V + W_O
+    + 3 × d_model × d_ff          → FFN 的 W1 + W2 + W3
+  )
+  d_model                        → Final RMSNorm 的 gamma
+  d_model × vocab_size           → Output Linear
+
+套 Nova 的值（d_model=384, max_seq_len=128, n_layers=4, d_ff=1536, n_heads=6, vocab_size=16000）：
+
+  P = 16000×384 + 128×384 + 4×(2×384 + 4×384² + 3×384×1536) + 384 + 384×16000
+    = 6,144,000 + 49,152 + 4×(768 + 589,824 + 1,769,472) + 384 + 6,144,000
+    = 6,144,000 + 49,152 + 4×2,360,064 + 384 + 6,144,000
+    = 6,144,000 + 49,152 + 9,440,256 + 384 + 6,144,000
+    = 21,777,792 ≈ 2180万
+
+
+二、固定开销
+------------
+
+公式：固定开销 = P × 4份 × 4 bytes = P × 16 bytes
+
+训练时，每一个参数在显存中要同时存 4 份：
+  第 1 份：权重本身          → 4 bytes（FP32）
+  第 2 份：梯度（反向传播算出来的） → 4 bytes（FP32）
+  第 3 份：Adam 一阶动量 m   → 4 bytes（FP32）
+  第 4 份：Adam 二阶动量 v   → 4 bytes（FP32）
+
+所以每个参数占 4 + 4 + 4 + 4 = 16 bytes，这跟 batch_size、max_seq_len 无关。
+
+套 Nova 的值：
+  固定开销 = 2180万 × 16 = 352 MB
+
+
+三、激活值
+激活_每Block = (7 × batch_size × max_seq_len × d_model
+             + 4 × batch_size × max_seq_len × d_ff
+             + batch_size × n_heads × max_seq_len × max_seq_len) × 4
+激活_总 = n_layers × 激活_每Block
+        + (batch_size × max_seq_len × d_model
+         + batch_size × max_seq_len × vocab_size) × 4
+
+四、训练总显存
+显存 = 固定开销 + 激活_总
+套算
+P = 16000×384 + 128×384 + 4×(2×384 + 4×384² + 3×384×1536) + 384 + 384×16000
+  = 21,777,792 ≈ 2180万
+固定开销 = 2180万 × 16 = 352 MB
+激活_每Block = (7×16×128×384 + 4×16×128×1536 + 16×6×128×128) × 4
+            = (3,440,640 + 12,582,912 + 1,572,864) × 4
+            = 67 MB
+激活_总 = 4 × 67 + (16×128×384 + 16×128×16000) × 4
+       = 268 + 128
+       = 396 MB
+显存 = 352 + 396 = 748 MB ≈ 实际约 860 MB（含 CUDA 开销）
