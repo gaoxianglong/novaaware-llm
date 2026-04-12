@@ -12,10 +12,9 @@
 │       ▼                                                             │
 │  NovaModel（完整模型，⑤）                                           │
 │   ├── Token Embedding    查字义表: token ID → n维向量              │
-│   ├── Position Embedding 查位置表: 位置编号 → n维向量              │
 │   ├── Dropout                                                       │
 │   ├── TransformerBlock × 4 层（④）                                   │
-│   │    ├── RMSNorm（①）→ MultiHeadAttention（③）→ 残差              │
+│   │    ├── RMSNorm（①）→ MultiHeadAttention（③ + RoPE）→ 残差       │
 │   │    └── RMSNorm（①）→ SwiGLUFFN（②）→ 残差                      │
 │   ├── RMSNorm（最终归一化）                                          │
 │   └── Linear 输出层: n维 → vocab_size                             │
@@ -128,13 +127,82 @@ class SwiGLUFFN(nn.Module):
 
 
 # ======================================================================
+# RoPE（旋转位置编码）
+# 不维护可训练的位置表，而是在 Attention 内部用数学公式对 Q 和 K 向量做旋转，
+# 通过旋转角度来编码位置信息。旋转使得 Q·K 点积结果只取决于两个 token 之间的
+# 相对距离（m - n），而非各自的绝对位置，因此天然支持上下文长度外推。
+# ======================================================================
+def precompute_rope_freqs(
+    head_dim: int,
+    max_seq_len: int,
+    theta: float = 10000.0,
+    scale_factor: float | None = None,
+) -> torch.Tensor:
+    """预计算 RoPE 的旋转频率矩阵。
+
+    返回 shape [max_seq_len, head_dim // 2] 的复数张量，
+    每个元素是 e^(i * m * θ_k)，表示位置 m 在第 k 对维度上的旋转角度。
+    """
+    # 每对维度的基础频率: θ_i = 1 / (10000 ^ (2i / head_dim))
+    # 低维度对 → θ 大 → 旋转快（捕捉近距离）
+    # 高维度对 → θ 小 → 旋转慢（捕捉远距离）
+    freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+
+    # 位置索引 [0, 1, 2, ..., max_seq_len - 1]
+    t = torch.arange(max_seq_len, dtype=torch.float32)
+
+    # 位置插值：将位置压缩回训练范围
+    # 例: scale_factor=4.0 时，[0,1,2,...,2047] → [0, 0.25, 0.5, ..., 511.75]
+    if scale_factor is not None:
+        t = t / scale_factor
+
+    # 外积得到每个位置在每对维度上的旋转角度
+    # angles[m, k] = m × θ_k
+    angles = torch.outer(t, freqs)  # [max_seq_len, head_dim // 2]
+
+    # 转为复数形式 e^(i×angle) = cos(angle) + i×sin(angle)
+    freqs_cis = torch.polar(torch.ones_like(angles), angles)
+    return freqs_cis
+
+
+def apply_rotary_emb(
+    q: torch.Tensor,          # [batch, n_heads, seq_len, head_dim]
+    k: torch.Tensor,          # [batch, n_heads, seq_len, head_dim]
+    freqs_cis: torch.Tensor,  # [seq_len, head_dim // 2]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """对 Q 和 K 施加旋转位置编码（RoPE）。
+
+    将 head_dim 维向量的相邻两个维度配对，视为复数的实部和虚部，
+    然后和 freqs_cis 做复数乘法实现旋转。
+
+    例: head_dim=64 的向量被切成 32 对
+        (x0,x1), (x2,x3), ..., (x62,x63)
+        每对视为复数 x0 + i*x1，乘以 e^(i*angle) 实现旋转
+    """
+    # [batch, n_heads, seq_len, head_dim]
+    # → [batch, n_heads, seq_len, head_dim//2, 2]
+    # → complex [batch, n_heads, seq_len, head_dim//2]
+    q_complex = torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
+    k_complex = torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
+
+    # 广播旋转频率到 [1, 1, seq_len, head_dim//2]
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)
+
+    # 复数乘法 = 二维旋转
+    q_rotated = torch.view_as_real(q_complex * freqs_cis).flatten(-2)
+    k_rotated = torch.view_as_real(k_complex * freqs_cis).flatten(-2)
+
+    return q_rotated.type_as(q), k_rotated.type_as(k)
+
+
+# ======================================================================
 # 多头自注意力计算
 # Block中的多头自注意力计算，本质就是将 输入向量*W_Q、W_K、W_V做矩阵运算，得到QKV线性投影，
 # 然后进行Q·K 点积 → 缩放（÷√d） → 因果掩码 → softmax → dropout → 加权 V → 新向量，最终得到了融合当前上下文的新向量激活值。
 # 完整流程图:
-#     x ─┬─→ W_Q ──→ Q ─┐
-#        ├─→ W_K ──→ K ─┼─→ Q@K^T/√d ─→ +mask ─→ softmax ─→ drop ─→ ×V ─→ concat ─→ W_O ─→ out
-#        └─→ W_V ──→ V ─┘
+#     x ─┬─→ W_Q ──→ Q ─→ RoPE(Q) ─┐
+#        ├─→ W_K ──→ K ─→ RoPE(K) ─┼─→ Q@K^T/√d ─→ +mask ─→ softmax ─→ drop ─→ ×V ─→ concat ─→ W_O ─→ out
+#        └─→ W_V ──→ V ────────────┘
 # ======================================================================
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1) -> None:
@@ -163,7 +231,7 @@ class MultiHeadAttention(nn.Module):
         #                  ↑随机变0            ↑随机变0
         self.attn_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         # x.shape会返回Tensor的形状，[batch, seq_len, d_model]三维数组
         batch_size, seq_len, _ = x.shape
 
@@ -195,6 +263,11 @@ class MultiHeadAttention(nn.Module):
         q = q.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # 2.5、RoPE 旋转位置编码：在注意力计算之前，对 Q 和 K 施加旋转
+        # 位置信息不再通过 pos_emb 加到输入向量上，而是在 Attention 内部通过旋转 Q、K 注入
+        # V 不旋转，因为位置信息只需要影响"谁和谁相关"（Q·K），不需要影响"提供什么内容"（V）
+        q, k = apply_rotary_emb(q, k, freqs_cis)
 
         # 3、pytorch的scaled_dot_product_attention函数会依次执行 Q·K 点积 → 缩放（÷√d） → 因果掩码 → softmax → dropout → 加权求和
         # 3.1、QK点积：每个自注意力头里，每个token的Q和所有token的K做点积，算出关联度分数，得到关联度矩阵
@@ -282,9 +355,9 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(d_model)
         self.ffn = SwiGLUFFN(d_model, d_ff)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1、先做RMSNorm -> 多头自注意力计算 -> 残差连接
-        x = x + self.attn(self.attn_norm(x))
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        # 1、先做RMSNorm -> 多头自注意力计算（含RoPE旋转） -> 残差连接
+        x = x + self.attn(self.attn_norm(x), freqs_cis)
 
         # 2、再做RMSNorm -> FFN -> 残差连接
         x = x + self.ffn(self.ffn_norm(x))
@@ -293,18 +366,25 @@ class TransformerBlock(nn.Module):
 
 # ======================================================================
 # Decoder-Only Transformer 模型，做工作流串联
-# Token Embedding -> Position Embedding -> Dropout -> TransformerBlock × n_layers 层 -> Final RMSNorm -> Output Linear
+# Token Embedding -> Dropout -> TransformerBlock × n_layers 层（含 RoPE） -> Final RMSNorm -> Output Linear
 # ======================================================================
 class NovaModel(nn.Module):
     def __init__(self, config: NovaConfig) -> None:
         super().__init__()
         self.config = config
 
-        # 初始化token_embedding
+        # 初始化token_embedding，长度为vocab_size
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
 
-        # 初始化position_embedding
-        self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
+        # 预计算 RoPE 旋转频率，注册为 buffer（不参与梯度计算，但会随模型保存/加载/to(device)）
+        head_dim = config.d_model // config.n_heads
+        freqs_cis = precompute_rope_freqs(
+            head_dim,
+            config.max_seq_len,
+            theta=config.rope_theta,
+            scale_factor=config.rope_scale_factor,
+        )
+        self.register_buffer("freqs_cis", freqs_cis)
 
         # 初始化dropout,这个和多头自注意力计算中丢的东西不同
         # 多头自注意力计算中丢的是softmax计算后的注意力权重，这里丢的是最初输入向量的部分维度
@@ -356,23 +436,18 @@ class NovaModel(nn.Module):
         batch_size, seq_len = input_ids.shape
 
         # 根据input_ids，查询token_embedding表，得到每一个token的token_emb([batch, seq_len, d_model]三维数组)
-        token_emb = self.token_emb(input_ids)
-
-        # 生成position_embedding的查询索引，表示形式为一维数组[0, 1, 2, ..., seq_len-1]
-        positions = torch.arange(seq_len, device=input_ids.device)
-        # 拿每一个positions[id]去查position_embedding，得到每一个token的position_emb([seq_len, d_model]二维数组)
-        pos_emb = self.pos_emb(positions)
-
-        # token_embedding+position_embedding构成最初的输入向量
-        # 数据结构为[batch, seq_len, d_model]三维数组
-        x = token_emb + pos_emb
+        # RoPE 方案下不再查位置表、不再做 token_emb + pos_emb 相加，位置信息在 Attention 内部通过旋转注入
+        x = self.token_emb(input_ids)
 
         # 每次训练进入Block前随机丢弃一部分嵌入维度，迫使模型不过度依赖某几个特征，避免过拟合
         x = self.emb_dropout(x)
 
+        # 截取当前序列长度对应的旋转频率
+        freqs_cis = self.freqs_cis[:seq_len]
+
         # 执行4层TransformerBlock计算,堆叠层数越深，模型对语义的理解会越深，训练效果越好
         for block in self.blocks:
-            x = block(x)  # [batch, seq_len, d_model]
+            x = block(x, freqs_cis)  # [batch, seq_len, d_model]
 
         # 最终RMSNorm归一化,保持向量空间的尺度最终稳定
         x = self.final_norm(x)  # [batch, seq_len, d_model]
@@ -404,14 +479,14 @@ class NovaModel(nn.Module):
         │ 组件                           │ 参数量     │ 占比        │
         ├────────────────────────────────┼───────────┼─────────────┤
         │ Token Embedding                │   128,000 │   9.69%     │
-        │ Position Embedding             │    16,384 │   1.24%     │
+        │ RoPE (buffer, 不参与训练)       │     4,096 │     N/A     │
         │ Block 0 - attn_norm            │       128 │   0.01%     │
         │ Block 0 - attn                 │    65,536 │   4.96%     │
         │ ...                            │           │             │
         │ Final RMSNorm                  │       128 │   0.01%     │
         │ Output Linear                  │   128,000 │   9.69%     │
         ├────────────────────────────────┼───────────┼─────────────┤
-        │ 总计                           │ 1,322,112 │ 100.00%     │
+        │ 总计                           │ 1,272,960 │ 100.00%     │
         └────────────────────────────────┴───────────┴─────────────┘
 
         调用时机:
@@ -424,7 +499,6 @@ class NovaModel(nn.Module):
         rows: list[tuple[str, int]] = []
 
         rows.append(("Token Embedding", self.token_emb.weight.numel()))
-        rows.append(("Position Embedding", self.pos_emb.weight.numel()))
 
         for i, block in enumerate(self.blocks):
             rows.append(
@@ -457,7 +531,10 @@ class NovaModel(nn.Module):
         )
         rows.append(("Output Linear", self.output.weight.numel()))
 
-        name_width = max(len(r[0]) for r in rows) + 2
+        rope_label = "RoPE freqs_cis (buffer)"
+        rope_numel = self.freqs_cis.numel()
+
+        name_width = max(max(len(r[0]) for r in rows), len(rope_label)) + 2
         print()
         print("=" * (name_width + 30))
         print("  Nova 模型参数统计")
@@ -467,7 +544,8 @@ class NovaModel(nn.Module):
         for name, count in rows:
             pct = count / total * 100 if total > 0 else 0
             print(f"  {name:<{name_width}} {count:>12,}  {pct:>7.2f}%")
+        print(f"  {rope_label:<{name_width}} {rope_numel:>12,}  {'N/A':>8}")
         print("-" * (name_width + 30))
-        print(f"  {'总计':<{name_width}} {total:>12,}  100.00%")
+        print(f"  {'总计(可训练)':<{name_width}} {total:>12,}  100.00%")
         print("=" * (name_width + 30))
         print()

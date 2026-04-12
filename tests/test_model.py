@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from config import NovaConfig
-from model import RMSNorm, SwiGLUFFN, MultiHeadAttention, TransformerBlock, NovaModel
+from model import RMSNorm, SwiGLUFFN, MultiHeadAttention, TransformerBlock, NovaModel, precompute_rope_freqs
 
 
 # ======================================================================
@@ -296,35 +296,40 @@ class TestMultiHeadAttention(unittest.TestCase):
         self.d_model = 128
         self.n_heads = 4
         self.head_dim = self.d_model // self.n_heads  # 32
+        self.max_seq_len = 128
         self.attn = MultiHeadAttention(self.d_model, self.n_heads, dropout=0.0)
         self.attn.eval()
+        self.freqs_cis = precompute_rope_freqs(self.head_dim, self.max_seq_len)
+
+    def _get_freqs(self, seq_len: int) -> torch.Tensor:
+        return self.freqs_cis[:seq_len]
 
     # ---- 形状测试 ----
 
     def test_output_shape_matches_input(self) -> None:
         """输出形状 = 输入形状 [batch, seq_len, d_model]。"""
         x = torch.randn(2, 10, self.d_model)
-        out = self.attn(x)
+        out = self.attn(x, self._get_freqs(10))
         self.assertEqual(out.shape, x.shape)
 
     def test_works_with_different_batch_sizes(self) -> None:
         """支持不同 batch_size。"""
         for bs in [1, 4, 16]:
             x = torch.randn(bs, 8, self.d_model)
-            out = self.attn(x)
+            out = self.attn(x, self._get_freqs(8))
             self.assertEqual(out.shape, (bs, 8, self.d_model))
 
     def test_works_with_different_seq_lengths(self) -> None:
         """支持不同序列长度。"""
         for sl in [1, 32, 128]:
             x = torch.randn(2, sl, self.d_model)
-            out = self.attn(x)
+            out = self.attn(x, self._get_freqs(sl))
             self.assertEqual(out.shape, (2, sl, self.d_model))
 
     def test_single_token_sequence(self) -> None:
         """seq_len=1 时也能正常工作（只能看自己）。"""
         x = torch.randn(1, 1, self.d_model)
-        out = self.attn(x)
+        out = self.attn(x, self._get_freqs(1))
         self.assertEqual(out.shape, (1, 1, self.d_model))
 
     # ---- 参数测试 ----
@@ -379,12 +384,13 @@ class TestMultiHeadAttention(unittest.TestCase):
           3. 再次计算位置 2 的输出，应该完全相同
         """
         torch.manual_seed(42)
+        freqs = self._get_freqs(5)
         x = torch.randn(1, 5, self.d_model)
-        out1 = self.attn(x)
+        out1 = self.attn(x, freqs)
 
         x_modified = x.clone()
         x_modified[0, 3:, :] = torch.randn(2, self.d_model)
-        out2 = self.attn(x_modified)
+        out2 = self.attn(x_modified, freqs)
 
         # 位置 0、1、2 只依赖位置 0~2，修改位置 3、4 不应影响它们
         torch.testing.assert_close(out1[0, :3, :], out2[0, :3, :])
@@ -395,12 +401,13 @@ class TestMultiHeadAttention(unittest.TestCase):
         验证逻辑: 修改位置 0 的输入后，位置 2 的输出应该变化（因为位置 2 能看到位置 0）。
         """
         torch.manual_seed(42)
+        freqs = self._get_freqs(5)
         x = torch.randn(1, 5, self.d_model)
-        out1 = self.attn(x)
+        out1 = self.attn(x, freqs)
 
         x_modified = x.clone()
         x_modified[0, 0, :] = torch.randn(self.d_model)
-        out2 = self.attn(x_modified)
+        out2 = self.attn(x_modified, freqs)
 
         # 位置 2 能看到位置 0，修改位置 0 后位置 2 的输出应该变化
         self.assertFalse(
@@ -413,7 +420,7 @@ class TestMultiHeadAttention(unittest.TestCase):
     def test_no_nan_or_inf(self) -> None:
         """输出不包含 NaN 或 Inf。"""
         x = torch.randn(4, 10, self.d_model)
-        out = self.attn(x)
+        out = self.attn(x, self._get_freqs(10))
         self.assertFalse(torch.isnan(out).any(), "输出包含 NaN")
         self.assertFalse(torch.isinf(out).any(), "输出包含 Inf")
 
@@ -421,18 +428,20 @@ class TestMultiHeadAttention(unittest.TestCase):
         """eval 模式下（Dropout 关闭），相同输入应产生相同输出。"""
         self.attn.eval()
         x = torch.randn(2, 8, self.d_model)
-        out1 = self.attn(x)
-        out2 = self.attn(x)
+        freqs = self._get_freqs(8)
+        out1 = self.attn(x, freqs)
+        out2 = self.attn(x, freqs)
         torch.testing.assert_close(out1, out2)
 
     def test_batch_independence(self) -> None:
         """batch 内各样本独立处理：修改样本 0 不影响样本 1 的输出。"""
         x = torch.randn(2, 6, self.d_model)
-        out_original = self.attn(x).clone()
+        freqs = self._get_freqs(6)
+        out_original = self.attn(x, freqs).clone()
 
         x_modified = x.clone()
         x_modified[0] = torch.randn(6, self.d_model)
-        out_modified = self.attn(x_modified)
+        out_modified = self.attn(x_modified, freqs)
 
         torch.testing.assert_close(out_original[1], out_modified[1])
 
@@ -442,7 +451,7 @@ class TestMultiHeadAttention(unittest.TestCase):
         """梯度能正常流过所有参数（反向传播不中断）。"""
         self.attn.train()
         x = torch.randn(2, 5, self.d_model, requires_grad=True)
-        out = self.attn(x)
+        out = self.attn(x, self._get_freqs(5))
         loss = out.sum()
         loss.backward()
         self.assertIsNotNone(x.grad)
@@ -461,10 +470,11 @@ class TestMultiHeadAttention(unittest.TestCase):
 #
 # 在模型中的调用位置:
 #   NovaModel.forward:
-#     x = token_emb + pos_emb
+#     x = token_emb(input_ids)
 #     x = dropout(x)
+#     freqs_cis = self.freqs_cis[:seq_len]
 #     for block in self.blocks:     ← 4 层循环
-#         x = block(x)             ← 每层调用一次
+#         x = block(x, freqs_cis)  ← 每层调用一次（含 RoPE）
 #     x = final_norm(x)
 #     logits = output_layer(x)
 # ======================================================================
@@ -476,31 +486,37 @@ class TestTransformerBlock(unittest.TestCase):
         self.n_heads = 4
         self.d_ff = 512
         self.dropout = 0.0
+        self.max_seq_len = 128
+        self.head_dim = self.d_model // self.n_heads
         self.block = TransformerBlock(
             self.d_model, self.n_heads, self.d_ff, self.dropout
         )
         self.block.eval()
+        self.freqs_cis = precompute_rope_freqs(self.head_dim, self.max_seq_len)
+
+    def _get_freqs(self, seq_len: int) -> torch.Tensor:
+        return self.freqs_cis[:seq_len]
 
     # ---- 形状测试 ----
 
     def test_output_shape_matches_input(self) -> None:
         """输出形状 = 输入形状 [batch, seq_len, d_model]。"""
         x = torch.randn(2, 10, self.d_model)
-        out = self.block(x)
+        out = self.block(x, self._get_freqs(10))
         self.assertEqual(out.shape, x.shape)
 
     def test_works_with_different_batch_sizes(self) -> None:
         """支持不同 batch_size。"""
         for bs in [1, 4, 16]:
             x = torch.randn(bs, 8, self.d_model)
-            out = self.block(x)
+            out = self.block(x, self._get_freqs(8))
             self.assertEqual(out.shape, (bs, 8, self.d_model))
 
     def test_works_with_different_seq_lengths(self) -> None:
         """支持不同序列长度。"""
         for sl in [1, 32, 128]:
             x = torch.randn(2, sl, self.d_model)
-            out = self.block(x)
+            out = self.block(x, self._get_freqs(sl))
             self.assertEqual(out.shape, (2, sl, self.d_model))
 
     # ---- 子模块结构测试 ----
@@ -553,7 +569,7 @@ class TestTransformerBlock(unittest.TestCase):
                 param.zero_()
 
         x = torch.randn(1, 5, self.d_model)
-        out = block(x)
+        out = block(x, self._get_freqs(5))
         # Attention 和 FFN 输出全零 → 残差后 output ≈ input
         torch.testing.assert_close(out, x, atol=1e-5, rtol=1e-5)
 
@@ -562,12 +578,13 @@ class TestTransformerBlock(unittest.TestCase):
     def test_causal_masking_through_block(self) -> None:
         """因果掩码在 Block 层面仍然有效：修改未来 token 不影响当前 token。"""
         torch.manual_seed(42)
+        freqs = self._get_freqs(6)
         x = torch.randn(1, 6, self.d_model)
-        out1 = self.block(x)
+        out1 = self.block(x, freqs)
 
         x_modified = x.clone()
         x_modified[0, 4:, :] = torch.randn(2, self.d_model)
-        out2 = self.block(x_modified)
+        out2 = self.block(x_modified, freqs)
 
         # 位置 0-3 只依赖位置 0-3，修改位置 4-5 不应影响
         torch.testing.assert_close(out1[0, :4, :], out2[0, :4, :])
@@ -577,7 +594,7 @@ class TestTransformerBlock(unittest.TestCase):
     def test_no_nan_or_inf(self) -> None:
         """输出不包含 NaN 或 Inf。"""
         x = torch.randn(4, 10, self.d_model)
-        out = self.block(x)
+        out = self.block(x, self._get_freqs(10))
         self.assertFalse(torch.isnan(out).any(), "输出包含 NaN")
         self.assertFalse(torch.isinf(out).any(), "输出包含 Inf")
 
@@ -585,18 +602,20 @@ class TestTransformerBlock(unittest.TestCase):
         """eval 模式下相同输入产生相同输出。"""
         self.block.eval()
         x = torch.randn(2, 8, self.d_model)
-        out1 = self.block(x)
-        out2 = self.block(x)
+        freqs = self._get_freqs(8)
+        out1 = self.block(x, freqs)
+        out2 = self.block(x, freqs)
         torch.testing.assert_close(out1, out2)
 
     def test_batch_independence(self) -> None:
         """batch 内各样本独立：修改样本 0 不影响样本 1。"""
         x = torch.randn(2, 6, self.d_model)
-        out_original = self.block(x).clone()
+        freqs = self._get_freqs(6)
+        out_original = self.block(x, freqs).clone()
 
         x_modified = x.clone()
         x_modified[0] = torch.randn(6, self.d_model)
-        out_modified = self.block(x_modified)
+        out_modified = self.block(x_modified, freqs)
 
         torch.testing.assert_close(out_original[1], out_modified[1])
 
@@ -606,7 +625,7 @@ class TestTransformerBlock(unittest.TestCase):
         """梯度能流过整个 Block（包括 Norm → Attention → FFN 全链路）。"""
         self.block.train()
         x = torch.randn(2, 5, self.d_model, requires_grad=True)
-        out = self.block(x)
+        out = self.block(x, self._get_freqs(5))
         loss = out.sum()
         loss.backward()
         self.assertIsNotNone(x.grad)
@@ -623,8 +642,9 @@ class TestTransformerBlock(unittest.TestCase):
         block2.eval()
 
         x = torch.randn(2, 8, self.d_model)
-        out1 = block1(x)
-        out2 = block2(out1)
+        freqs = self._get_freqs(8)
+        out1 = block1(x, freqs)
+        out2 = block2(out1, freqs)
         self.assertEqual(out2.shape, x.shape)
         self.assertFalse(torch.isnan(out2).any())
 
@@ -636,11 +656,10 @@ class TestTransformerBlock(unittest.TestCase):
 #   input_ids [batch, seq_len]
 #       │
 #   ① Token Embedding: ID → d_model 维向量（查字义表）
-#   ② Position Embedding: 位置编号 → d_model 维向量（查位置表）
-#   ③ 相加 + Dropout
-#   ④ TransformerBlock × n_layers
-#   ⑤ Final RMSNorm
-#   ⑥ Output Linear: d_model → vocab_size
+#   ② Dropout
+#   ③ TransformerBlock × n_layers（含 RoPE 旋转位置编码）
+#   ④ Final RMSNorm
+#   ⑤ Output Linear: d_model → vocab_size
 #       │
 #   logits [batch, seq_len, vocab_size]
 #
@@ -698,14 +717,13 @@ class TestNovaModel(unittest.TestCase):
             self.model.token_emb.embedding_dim, self.config.d_model
         )
 
-    def test_has_position_embedding(self) -> None:
-        """必须包含 pos_emb（位置表）。"""
-        self.assertIsInstance(self.model.pos_emb, nn.Embedding)
+    def test_has_freqs_cis_buffer(self) -> None:
+        """必须包含 freqs_cis（RoPE 旋转频率 buffer）。"""
+        self.assertTrue(hasattr(self.model, "freqs_cis"))
+        head_dim = self.config.d_model // self.config.n_heads
         self.assertEqual(
-            self.model.pos_emb.num_embeddings, self.config.max_seq_len
-        )
-        self.assertEqual(
-            self.model.pos_emb.embedding_dim, self.config.d_model
+            self.model.freqs_cis.shape,
+            (self.config.max_seq_len, head_dim // 2),
         )
 
     def test_has_correct_number_of_blocks(self) -> None:
@@ -739,16 +757,15 @@ class TestNovaModel(unittest.TestCase):
 
         对于 d_model=64, n_layers=2, vocab_size=100 的小模型:
           Token Emb:    100 × 64         = 6,400
-          Pos Emb:      32 × 64          = 2,048
+          RoPE buffer:  不计入可训练参数
           Blocks × 2:   2 × (2×64 + 4×64² + 3×64×256) = 2 × (128 + 16384 + 49152) = 131,328
           Final Norm:   64               = 64
           Output:       64 × 100         = 6,400
           ────────────────────────────────────────
-          总计:         146,240
+          总计:         144,192
         """
         expected = (
             self.config.vocab_size * self.config.d_model          # token_emb
-            + self.config.max_seq_len * self.config.d_model       # pos_emb
             + self.config.n_layers * (
                 2 * self.config.d_model                           # 2 个 RMSNorm
                 + 4 * self.config.d_model ** 2                    # Attention
@@ -895,16 +912,6 @@ class TestWeightInitialization(unittest.TestCase):
         std = self.model.token_emb.weight.data.std().item()
         self.assertAlmostEqual(std, 0.02, delta=0.005)
 
-    def test_position_embedding_mean_near_zero(self) -> None:
-        """Position Embedding 的均值应接近 0。"""
-        mean = self.model.pos_emb.weight.data.mean().item()
-        self.assertAlmostEqual(mean, 0.0, delta=0.01)
-
-    def test_position_embedding_std_near_002(self) -> None:
-        """Position Embedding 的标准差应接近 0.02。"""
-        std = self.model.pos_emb.weight.data.std().item()
-        self.assertAlmostEqual(std, 0.02, delta=0.005)
-
     # ---- Linear 层: Xavier 均匀分布 ----
 
     def test_linear_layers_xavier_range(self) -> None:
@@ -1005,11 +1012,10 @@ class TestParameterSummary(unittest.TestCase):
         self.assertEqual(self.model.count_parameters(), expected)
 
     def test_count_parameters_formula(self) -> None:
-        """count_parameters() 与公式计算一致。"""
+        """count_parameters() 与公式计算一致（RoPE 无可训练参数，不计入）。"""
         c = self.config
         expected = (
             c.vocab_size * c.d_model
-            + c.max_seq_len * c.d_model
             + c.n_layers * (2 * c.d_model + 4 * c.d_model ** 2 + 3 * c.d_model * c.d_ff)
             + c.d_model
             + c.d_model * c.vocab_size
@@ -1026,7 +1032,7 @@ class TestParameterSummary(unittest.TestCase):
         output = buf.getvalue()
         self.assertIn("Nova", output)
         self.assertIn("Token Embedding", output)
-        self.assertIn("Position Embedding", output)
+        self.assertIn("RoPE", output)
         self.assertIn("Block 0", output)
         self.assertIn("Final RMSNorm", output)
         self.assertIn("Output Linear", output)

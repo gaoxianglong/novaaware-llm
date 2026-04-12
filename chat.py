@@ -83,8 +83,8 @@ def generate(
     generated_ids: list[int] = []
     # 自回归循环(核心循环)
     for _ in range(max_new_tokens):
-        # 截断输入序列，确保不超过位置编码表的长度限制（max_seq_len），超出截断前面的内容
-        ids_cond = ids[:, -model.pos_emb.weight.shape[0] :]
+        # 截断输入序列，确保不超过模型的最大上下文长度（max_seq_len），超出截断前面的内容
+        ids_cond = ids[:, -model.config.max_seq_len :]
 
         # 调用模型的forward函数，进行前向传播计算
         logits = model(ids_cond)  # [1, seq_len, vocab_size]

@@ -67,13 +67,13 @@ class NovaConfig:
     # max_seq_len = 256, batch_size = 16，vocab_size=16000
     # 训练预算: 3 亿预训练 tokens + 1 亿 SFT tokens = 4 亿 (Chinchilla 最优)
 
-    # Total = V × D + S × D + L × (2D + 4D² + 3D × F) + D + D × V
+    # Total = V × D + L × (2D + 4D² + 3D × F) + D + D × V
     # 其中：
     # V = vocab_size（词表大小）
     # D = d_model（嵌入维度）
-    # S = max_seq_len（最大序列长度）
     # L = n_layers（Transformer 层数）
     # F = d_ff（FFN 隐藏维度）
+    # 注：RoPE 无可训练参数，不计入参数量公式
 
     # 向量维度/特征维度
     d_model: int = 384
@@ -95,6 +95,16 @@ class NovaConfig:
 
     # dropout概率,推理时关闭
     dropout: float = 0.1
+
+    # RoPE 基础频率（控制旋转速度的基数，业界标准值）
+    rope_theta: float = 10000.0
+
+    # 位置插值缩放因子
+    # None = 不插值（推理上下文 = 训练上下文）
+    # 2.0 = 上下文扩展 2 倍
+    # 4.0 = 上下文扩展 4 倍
+    # rope_scale_factor: float | None = None
+    rope_scale_factor: float =2.0
 
     # 词表大小,由BPE分词器在扫描训练数据后动态设置
     vocab_size: int = 0

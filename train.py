@@ -19,7 +19,6 @@ import random
 import time
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from config import NovaConfig
@@ -31,7 +30,7 @@ from dataset import (
     load_qa_pairs,
     load_pretrain_data,
 )
-from model import NovaModel
+from model import NovaModel, precompute_rope_freqs
 
 
 # ======================================================================
@@ -504,18 +503,18 @@ def setup_finetune(
         print(f"\n加载预训练权重: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         state_dict = checkpoint["model_state_dict"]
-        cur_seq_len = config.max_seq_len
-        ckpt_seq_len = state_dict["pos_emb.weight"].shape[0]
-        if ckpt_seq_len != cur_seq_len:
-            print(f"  → 位置编码调整: {ckpt_seq_len} → {cur_seq_len}")
-            old_weight = state_dict["pos_emb.weight"]
-            if ckpt_seq_len > cur_seq_len:
-                state_dict["pos_emb.weight"] = old_weight[:cur_seq_len]
-            else:
-                new_weight = torch.zeros(cur_seq_len, old_weight.shape[1])
-                nn.init.normal_(new_weight, mean=0.0, std=0.02)
-                new_weight[:ckpt_seq_len] = old_weight
-                state_dict["pos_emb.weight"] = new_weight
+
+        # RoPE 使用数学公式计算，不存储可训练权重。如果微调阶段 max_seq_len 与预训练不同，
+        # 只需重新计算 freqs_cis buffer，无需像旧方案那样截断/扩展 pos_emb.weight
+        ckpt_config: NovaConfig = checkpoint["config"]
+        if ckpt_config.max_seq_len != config.max_seq_len:
+            print(f"  → RoPE 频率重算: {ckpt_config.max_seq_len} → {config.max_seq_len}")
+            head_dim = config.d_model // config.n_heads
+            new_freqs = precompute_rope_freqs(
+                head_dim, config.max_seq_len, theta=config.rope_theta
+            ).to(device)
+            state_dict["freqs_cis"] = new_freqs
+
         model.load_state_dict(state_dict)
         print(f"  → 已加载预训练权重，微调从 epoch 0 开始")
 
