@@ -192,7 +192,7 @@ def train(
             # CUDA时进行混合精度训练
             with torch.amp.autocast("cuda", enabled=use_amp):
                 # 回调模型的forward()函数
-                # Token Embedding -> Position Embedding -> Dropout -> TransformerBlock × n_layers 层 -> Final RMSNorm -> Output Linear
+                # Token Embedding -> Dropout -> TransformerBlock × n_layers 层（含 RoPE） -> Final RMSNorm -> Output Linear
                 # 得到batch*seq_len个token的vocab_size预测分数
                 logits = model(input_ids)
 
@@ -511,7 +511,8 @@ def setup_finetune(
             print(f"  → RoPE 频率重算: {ckpt_config.max_seq_len} → {config.max_seq_len}")
             head_dim = config.d_model // config.n_heads
             new_freqs = precompute_rope_freqs(
-                head_dim, config.max_seq_len, theta=config.rope_theta
+                head_dim, config.max_seq_len, theta=config.rope_theta,
+                scale_factor=config.rope_scale_factor,
             ).to(device)
             state_dict["freqs_cis"] = new_freqs
 

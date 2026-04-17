@@ -96,15 +96,14 @@ class NovaConfig:
     # dropout概率,推理时关闭
     dropout: float = 0.1
 
-    # RoPE 基础频率（控制旋转速度的基数，业界标准值）
+    # RoPE 基础频率（控制单位旋转角度的基数，业界标准值）
     rope_theta: float = 10000.0
 
-    # 位置插值缩放因子
+    # 位置插值缩放因子（仅推理时使用，训练时必须为 None）
     # None = 不插值（推理上下文 = 训练上下文）
-    # 2.0 = 上下文扩展 2 倍
-    # 4.0 = 上下文扩展 4 倍
-    # rope_scale_factor: float | None = None
-    rope_scale_factor: float =2.0
+    # 2.0 = 推理时上下文扩展 2 倍
+    # 4.0 = 推理时上下文扩展 4 倍
+    rope_scale_factor: float | None = None
 
     # 词表大小,由BPE分词器在扫描训练数据后动态设置
     vocab_size: int = 0
@@ -161,3 +160,11 @@ class NovaConfig:
     # 设为 0。这样既保留了一定的多样性（不是贪心地只选第 1 名），又避免了从概率
     # 极低的"噪声"字中采样导致输出乱码
     top_k: int = 20
+
+    # 重复惩罚系数（Repetition Penalty）。
+    #     生成时对已经出现过的 token 的 logits 做缩放，降低其再次被采样的概率，防止模型
+    #     反复说同样的话或陷入死循环。
+    #     - = 1.0：不启用重复惩罚
+    #     - > 1.0：对已出现 token 施加惩罚（正分除以系数、负分乘以系数）
+    #     1.3 是社区常用的轻度惩罚值，过大会让生成结果失去自然度。
+    repetition_penalty: float = 1.3

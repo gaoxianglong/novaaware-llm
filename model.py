@@ -127,71 +127,109 @@ class SwiGLUFFN(nn.Module):
 
 
 # ======================================================================
-# RoPE（旋转位置编码）
-# 不维护可训练的位置表，而是在 Attention 内部用数学公式对 Q 和 K 向量做旋转，
-# 通过旋转角度来编码位置信息。旋转使得 Q·K 点积结果只取决于两个 token 之间的
-# 相对距离（m - n），而非各自的绝对位置，因此天然支持上下文长度外推。
+# RoPE旋转位置编码
+# 计算每一个位置的真实旋转角度，并生成旋转系数表
 # ======================================================================
 def precompute_rope_freqs(
     head_dim: int,
     max_seq_len: int,
+    # 控制单位旋转角度的基数
     theta: float = 10000.0,
+    # 位置插值的缩放因子
     scale_factor: float | None = None,
 ) -> torch.Tensor:
-    """预计算 RoPE 的旋转频率矩阵。
+    # 一、单位旋转角度的计算：
+    # 以 head_dim 为区间、步长为 2，算出 32 个组编号 [0, 2, 4, ..., 62]，然后每个组编号除以 head_dim 得到 0~1 之间的比例。
+    # 再用基数 10000 对这个比例做幂运算，最后取倒数，得到每组的单位旋转角度。最终效果是 32 个单位角度从 1.0 指数递减到 0.000132，前面的组步长大（捕捉近距离），后面的组步长小（捕捉远距离）。
 
-    返回 shape [max_seq_len, head_dim // 2] 的复数张量，
-    每个元素是 e^(i * m * θ_k)，表示位置 m 在第 k 对维度上的旋转角度。
-    """
-    # 每对维度的基础频率: θ_i = 1 / (10000 ^ (2i / head_dim))
-    # 低维度对 → θ 大 → 旋转快（捕捉近距离）
-    # 高维度对 → θ 小 → 旋转慢（捕捉远距离）
+    # 计算 32 个单位旋转角度（每往后走 1 个位置，该组转多少度）
+    # 计算过程：freqs = 1 / (theta ^ 比例)，分3步：
+    #
+    #   1、torch.arange(0, head_dim, 2).float() / head_dim算比例：64 个维度两两配对分成 32 组，组编号 [0,2,4,...,62] 除以 64 得到 0~1 之间的比例
+    #      [0/64, 2/64, 4/64, ..., 62/64] = [0.0, 0.03125, 0.0625, ..., 0.96875]
+    #
+    #   2、算基数的幂：10000 ^ 比例，比例越大结果越大
+    #      10000^0.0 = 1 → 10000^0.03 = 1.318 → ... → 10000^0.5 = 100 → ... → 10000^0.97 = 7586
+    #
+    #   3、取倒数得到单位旋转角度：
+    #      1/1 = 1.0（大步长，近距离敏感） → 1/100 = 0.01 → 1/7586 = 0.000132（小步长，远距离敏感）
+    #
+    # 最终 32 个单位角度从 1.0 指数递减到 0.000132，32 组分工协作覆盖从近到远的距离感知
     freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
 
-    # 位置索引 [0, 1, 2, ..., max_seq_len - 1]
-    t = torch.arange(max_seq_len, dtype=torch.float32)
+    # 二、位置插值计算
+    # 1、先算扩展位置表的长度，max_seq_len * scale_factor(缩放因子)
+    extended_len = (
+        int(max_seq_len * scale_factor) if scale_factor is not None else max_seq_len
+    )
 
-    # 位置插值：将位置压缩回训练范围
-    # 例: scale_factor=4.0 时，[0,1,2,...,2047] → [0, 0.25, 0.5, ..., 511.75]
+    # 2、生成位置编号序列t，比如[0,1,2,3...extended_len-1]
+    #   假设extended_len = 256，t = [0,1,...,255] / 2.0 = [0, 0.5, ..., 127.5]，表有 256 行（覆盖 2 倍上下文），将真实旋转角度 落在训练见过的 [0, 127.5] 范围内
+    t = torch.arange(
+        extended_len, dtype=torch.float32
+    )  # freqs_cis用float32保证精度，没有任何代价(不参与反向传播，不消耗训练显存，也不影响训练速度)
+
+    # 每个位置的真实旋转角度 = 位置 x 单位旋转角度，夹角(角度差)的计算方式是 (m-n)θ，这意味着scale_factor越大，相邻位置的角夹越小，模型越难区分相邻token
+    #   以步长最大的组（θ_0=1.0）为例，相邻位置的角度差 = 1.0 / scale_factor：
+    #   scale_factor=1 → 角度差 = 1.0    → "我" 和 "爱" 转了整整 1 弧度，差异巨大，轻松区分
+    #   scale_factor=2 → 角度差 = 0.5    → 差异缩小一半，还能分清
+    #   scale_factor=4 → 角度差 = 0.25   → 差异只剩 1/4，开始吃力
+    #   scale_factor=8 → 角度差 = 0.125  → 差异很小，模型难以分辨相邻 token 的位置
+    #   而步长最小的组（θ_31≈0.000132）情况更糟，scale_factor=8 → 角度差 = 0.0000165，几乎重叠，位置信号基本消失
+    #   一般 2~4 倍效果不错，超过 8 倍质量明显下降
     if scale_factor is not None:
+        # 3、除以缩放因子把每个位置的 真实旋转角度 映射回训练范围
         t = t / scale_factor
 
-    # 外积得到每个位置在每对维度上的旋转角度
-    # angles[m, k] = m × θ_k
-    angles = torch.outer(t, freqs)  # [max_seq_len, head_dim // 2]
+    # 三、计算每个位置的真实旋转角度
+    # t     = [0, 1, 2, ..., extended_len-1]  ← extended_len 个位置编号（有 scale_factor 时已缩放）
+    # freqs = [1.0, 0.759, ..., 0.000132]       ← 32 个单位旋转角度（每个位置转多少度）
+    angles = torch.outer(
+        t, freqs
+    )  # [extended_len, head_dim / 2] 每一个位置的32组真实旋转角度
 
-    # 转为复数形式 e^(i×angle) = cos(angle) + i×sin(angle)
+    # 四、把每个位置的每组角度，预先算好对应的 cos 和 sin，生成转系数表（没有这一步QK无法旋转，角度是几何概念，旋转是数学概念）
+    # 转为复数形式 e^(i×angle) = cos(angle) + i×sin(angle)    # torch.polar(1.0, 角度1.0) = 0.540 + 0.841i
+    #                          ↑         ↑
+    #                        系数A     系数B
+    # 旋转公式（手动算）:
+    #   q0' = q0 × 0.540 − q1 × 0.841
+    #   q1' = q0 × 0.841 + q1 × 0.540
+    # 用复数计算:
+    #   (q0 + q1·i) × (0.540 + 0.841·i) = q0' + q1'·i
     freqs_cis = torch.polar(torch.ones_like(angles), angles)
-    return freqs_cis
+    # freqs_cis是通过复数计算出来的旋转系数表
+    return freqs_cis  # [extended_len, head_dim / 2] 有scale_factor时表更长，覆盖扩展后的上下文范围
 
 
+# 旋转Q和K向量中的head_dim维向量
 def apply_rotary_emb(
-    q: torch.Tensor,          # [batch, n_heads, seq_len, head_dim]
-    k: torch.Tensor,          # [batch, n_heads, seq_len, head_dim]
-    freqs_cis: torch.Tensor,  # [seq_len, head_dim // 2]
+    q: torch.Tensor,  # [batch, n_heads, seq_len, head_dim]
+    k: torch.Tensor,  # [batch, n_heads, seq_len, head_dim]
+    freqs_cis: torch.Tensor,  # [seq_len, head_dim / 2]  预计算好的旋转系数表
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """对 Q 和 K 施加旋转位置编码（RoPE）。
 
-    将 head_dim 维向量的相邻两个维度配对，视为复数的实部和虚部，
-    然后和 freqs_cis 做复数乘法实现旋转。
-
-    例: head_dim=64 的向量被切成 32 对
-        (x0,x1), (x2,x3), ..., (x62,x63)
-        每对视为复数 x0 + i*x1，乘以 e^(i*angle) 实现旋转
-    """
-    # [batch, n_heads, seq_len, head_dim]
-    # → [batch, n_heads, seq_len, head_dim//2, 2]
-    # → complex [batch, n_heads, seq_len, head_dim//2]
+    # 1、打包：把 q, k 转成 float32，然后把最后一维两两配对，塞进 PyTorch 的复数容器
+    #        [batch, n_heads, seq_len, head_dim] → [batch, n_heads, seq_len, head_dim//2]（每个元素是一个复数）
+    #        例如 head_dim=4 时：[a, b, c, d] → [(a,b), (c,d)] → [a+bi, c+di]
     q_complex = torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
     k_complex = torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
 
-    # 广播旋转频率到 [1, 1, seq_len, head_dim//2]
+    # 2、对齐：freqs_cis 只有 [seq_len, half_dim] 两个维度，q 有 [batch, n_heads, seq_len, half_dim] 四个维度
+    #        给 freqs_cis 前面补两个 1，变成 [1, 1, seq_len, half_dim]，这样同一张旋转表被所有 batch 和 head 复用
     freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)
 
-    # 复数乘法 = 二维旋转
+    # 3、旋转 + 拆包：
+    #   旋转：逐元素乘法，每个位置的每组配对都乘上对应的旋转系数
+    #        位置0 的系数和位置1 的不同，所以旋转后的结果就带上了位置信息
+    #        旋转前：位置0 [a, b, c, d]    位置1 [a, b, c, d]  ← 假设内容一样
+    #        旋转后：位置0 [a',b',c',d']   位置1 [a'',b'',c'',d'']  ← 结果不同了，位置信息就在这里
+    #   拆包：把复数容器拆回普通实数 tensor，再合并回 head_dim 维度
     q_rotated = torch.view_as_real(q_complex * freqs_cis).flatten(-2)
     k_rotated = torch.view_as_real(k_complex * freqs_cis).flatten(-2)
 
+    # 4、恢复精度：从 float32 转回原来的精度（比如 bfloat16），输出形状和输入完全一样
+    # 返回旋转后的QK的head_dim维向量
     return q_rotated.type_as(q), k_rotated.type_as(k)
 
 
@@ -264,9 +302,7 @@ class MultiHeadAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # 2.5、RoPE 旋转位置编码：在注意力计算之前，对 Q 和 K 施加旋转
-        # 位置信息不再通过 pos_emb 加到输入向量上，而是在 Attention 内部通过旋转 Q、K 注入
-        # V 不旋转，因为位置信息只需要影响"谁和谁相关"（Q·K），不需要影响"提供什么内容"（V）
+        # 2.5、RoPE 旋转位置编码：按每个位置的旋转角度旋转 Q 和 K，编入绝对位置信息（旋转后的值）；相对位置信息在后续 QK 点积时自动涌现
         q, k = apply_rotary_emb(q, k, freqs_cis)
 
         # 3、pytorch的scaled_dot_product_attention函数会依次执行 Q·K 点积 → 缩放（÷√d） → 因果掩码 → softmax → dropout → 加权求和
@@ -376,14 +412,25 @@ class NovaModel(nn.Module):
         # 初始化token_embedding，长度为vocab_size
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
 
-        # 预计算 RoPE 旋转频率，注册为 buffer（不参与梯度计算，但会随模型保存/加载/to(device)）
+        # 计算出每一个自注意力头计算的向量维度
         head_dim = config.d_model // config.n_heads
+
+        # 计算出max_seq_len x head_dim/2个旋转角度，tensor的shape为[max_seq_len, head_dim/2]
+        # 这里要搞清楚一件事情，一个token的维度是384，那么6个自注意力头，每个头负责64维向量空间，
+        # 旋转是几何操作，一个平面需要2个数字，一个位置有head_dim/2个旋转角度，相同位置的token共用一套旋转角度
+        # Q 向量的 64 个数字:
+        # [q0, q1,  q2, q3,  q4, q5,  q6, q7,  ...,  q62, q63]
+        #  \_____/  \_____/  \_____/  \_____/         \_______/
+        #   第0组    第1组    第2组    第3组    ...     第31组
         freqs_cis = precompute_rope_freqs(
             head_dim,
             config.max_seq_len,
+            # 控制单位旋转角度的基数
             theta=config.rope_theta,
+            # 位置插值缩放因子，训练时不使用，推理时使用x2或x4扩展上下文长度
             scale_factor=config.rope_scale_factor,
         )
+        # 把 freqs_cis 注册为模型的 buffer
         self.register_buffer("freqs_cis", freqs_cis)
 
         # 初始化dropout,这个和多头自注意力计算中丢的东西不同
@@ -442,7 +489,8 @@ class NovaModel(nn.Module):
         # 每次训练进入Block前随机丢弃一部分嵌入维度，迫使模型不过度依赖某几个特征，避免过拟合
         x = self.emb_dropout(x)
 
-        # 截取当前序列长度对应的旋转频率
+        # 截取当前序列长度对应的旋转系数,跟实际输入长度对齐，否则维度不匹配会报错
+        # 训练时对其填充或裁剪到max_seq_len长度用不上，这里主要是推理的时候用，假设seq_len=10，那么只取前10个位置的AB系数
         freqs_cis = self.freqs_cis[:seq_len]
 
         # 执行4层TransformerBlock计算,堆叠层数越深，模型对语义的理解会越深，训练效果越好

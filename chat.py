@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from config import NovaConfig
 from tokenizer import NovaTokenizer, BOS_ID, SEP_ID, EOS_ID
-from model import NovaModel
+from model import NovaModel, precompute_rope_freqs
 
 
 # 推理等待动画
@@ -66,13 +66,13 @@ def generate(
     model: NovaModel,
     tokenizer: NovaTokenizer,
     question: str,
-    # 重复惩罚系数，防止模型反复说同样的话
-    repetition_penalty: float = 1.3,
 ) -> str:
     # 获取模型的计算设备
     device = next(model.parameters()).device
     # 单次回答最多生成多少个答案 token
     max_new_tokens = _DEFAULTS.max_new_tokens
+    # 重复惩罚系数，防止模型反复说同样的话
+    repetition_penalty = _DEFAULTS.repetition_penalty
 
     # 把用户的输入问题编码为 token ids，然后首尾分别拼接上<s>和<sep>
     input_ids = [BOS_ID] + tokenizer.encode(question) + [SEP_ID]
@@ -184,6 +184,26 @@ def load_model_for_inference(
     model = NovaModel(config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
+    # 位置插值：推理时扩展上下文窗口
+    # 训练时 scale_factor=None，checkpoint 中的 freqs_cis 覆盖训练长度
+    # 推理时若 scale_factor 非空，重算 freqs_cis 以覆盖扩展后的长度，并更新 max_seq_len
+    if config.rope_scale_factor is not None:
+        train_len = config.max_seq_len
+        extended_len = int(train_len * config.rope_scale_factor)
+        head_dim = config.d_model // config.n_heads
+        new_freqs = precompute_rope_freqs(
+            head_dim,
+            max_seq_len=extended_len,
+            theta=config.rope_theta,
+            scale_factor=config.rope_scale_factor,
+        ).to(device)
+        model.freqs_cis = new_freqs
+        model.config.max_seq_len = extended_len
+        print(
+            f"位置插值已启用: 上下文 {train_len} → {extended_len} "
+            f"(scale_factor={config.rope_scale_factor})"
+        )
+
     # 训练的时候用train模式，推理的时候用评估(推理)模式
     model.eval()
 
@@ -266,7 +286,11 @@ def main() -> None:
         sys.exit(1)
 
     print(f"模型已加载: {args.checkpoint} (device={device})")
-    print(f"生成参数: temperature={_DEFAULTS.temperature}, top_k={_DEFAULTS.top_k}")
+    print(
+        f"生成参数: temperature={_DEFAULTS.temperature}, "
+        f"top_k={_DEFAULTS.top_k}, "
+        f"repetition_penalty={_DEFAULTS.repetition_penalty}"
+    )
 
     # 启动对话
     chat_loop(
